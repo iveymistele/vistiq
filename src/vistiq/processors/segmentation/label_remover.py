@@ -122,12 +122,40 @@ class LabelRemoverProcessor(BaseProcessor):
         return ["labels"]
 
     def run(self, data: WorkflowData) -> WorkflowData:
+    
         updated = dict(data)
 
-        updated["labels"] = self.remover.run(
+        result = self.remover.run(
             labels=data["labels"],
             region_properties=data.get("labels_to_remove", []),
             metadata=data.get("metadata"),
         )
+
+        # handle tuple output
+        if isinstance(result, tuple):
+            labels_out, metadata_out = result
+            updated["labels"] = labels_out
+            updated["metadata"] = metadata_out
+        else:
+            updated["labels"] = result
+
+        # keep region_features consistent with updated labels
+        if "region_features" in updated and updated["region_features"] is not None:
+            remaining_labels = set(int(x) for x in np.unique(updated["labels"]) if int(x) != 0)
+            feats = updated["region_features"]
+
+            if isinstance(feats, pd.DataFrame):
+                # if labels are the index
+                if feats.index.name == "label" or "label" in str(feats.index.name).lower():
+                    updated["region_features"] = feats.loc[feats.index.isin(remaining_labels)]
+                # fallback if label is a column
+                elif "label" in feats.columns:
+                    updated["region_features"] = feats.loc[feats["label"].isin(remaining_labels)]
+            elif isinstance(feats, list):
+                updated["region_features"] = [
+                    r for r in feats
+                    if getattr(r, "label", None) in remaining_labels
+                ]
+
 
         return updated

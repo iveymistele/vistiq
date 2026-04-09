@@ -2178,7 +2178,7 @@ class MicroSAMSegmenter(Segmenter):
 
 # bridge from old workflow to new workflow
 
-from __future__ import annotations
+
 
 from vistiq.workflows.segmentation import run_segmentation_workflow
 

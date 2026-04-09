@@ -18,7 +18,7 @@ def test_segmentation_workflow_poc():
             properties=["label", "centroid"],
         ),
         label_remover_config=LabelRemoverConfig(),
-        debug=True,   # 🔥 THIS is what I meant
+        debug=True,   #  THIS is what I meant
     )
 
     result = workflow.run({

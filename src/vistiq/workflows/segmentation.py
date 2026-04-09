@@ -2,7 +2,7 @@ from vistiq.processors.pipeline import ProcessorPipeline
 from vistiq.processors.segmentation.label_remover import LabelRemoverProcessor
 from vistiq.processors.segmentation.region_analyzer import RegionAnalyzerProcessor
 
-from vistiq.analysis import RegionAnalyzerConfig
+from vistiq.seg import RegionAnalyzerConfig
 
 
 def build_segmentation_workflow(
@@ -17,3 +17,7 @@ def build_segmentation_workflow(
         ],
         debug=debug,
     )
+
+def run_segmentation_workflow(data, **kwargs):
+    workflow = build_segmentation_workflow(**kwargs)
+    return workflow.run(data)

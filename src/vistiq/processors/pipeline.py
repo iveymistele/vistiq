@@ -4,15 +4,11 @@ from vistiq.processors.base import BaseProcessor
 from vistiq.processors.types import WorkflowData
 
 
-from __future__ import annotations
 
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from vistiq.processors.base import BaseProcessor
-from vistiq.processors.types import WorkflowData
 
 
 def summarize_state(data: WorkflowData) -> None:
@@ -45,11 +41,17 @@ def summarize_state(data: WorkflowData) -> None:
                 pass
 
 class ProcessorPipeline:
-    def __init__(self, processors: list[BaseProcessor]):
+    def __init__(self, processors: list[BaseProcessor], debug: bool = False):
         self.processors = processors
+        self.debug = debug
 
     def run(self, data: WorkflowData) -> WorkflowData:
         current = dict(data)
+
+        if self.debug:
+            print("Initial state:")
+            summarize_state(current)
+
         for processor in self.processors:
             current = processor.run(current)
 
