@@ -2175,3 +2175,18 @@ class MicroSAMSegmenter(Segmenter):
         else:
             logger.info("No regions to compute, returning binary mask and labels")
             return binary_mask, labels
+
+# bridge from old workflow to new workflow
+
+from __future__ import annotations
+
+from vistiq.workflows.segmentation import run_segmentation_workflow
+
+
+def run_segmentation_processor_poc(labels, remove_labels=None, **kwargs):
+    data = {
+        "labels": labels,
+        "remove_labels": remove_labels or [],
+    }
+    data.update(kwargs)
+    return run_segmentation_workflow(data)
