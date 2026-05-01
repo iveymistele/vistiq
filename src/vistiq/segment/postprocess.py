@@ -200,7 +200,7 @@ class Watershed(Configurable[WatershedConfig]):
 
     @classmethod
     def from_config(cls, config: "WatershedConfig") -> "Watershed":
-        """Create a RegionAnalyzer instance from a configuration.
+        """Create a Watershed processor instance from a configuration.
 
         Args:
             config: Watershed configuration.
@@ -267,10 +267,13 @@ class Watershed(Configurable[WatershedConfig]):
             and len(metadata["scale"]) >= mask.ndim
         ):
             min_dist_pixel = int(
-                np.min(self.config.min_distance / np.array(metadata["scale"]))
+                np.min(
+                    self.config.min_distance
+                    / np.array(metadata["physical_pixel_sizes"])
+                )
             )
             logger.info(
-                f"metadata['scale']={metadata['scale']}, min_distance={self.config.min_distance}, min_dist_pixel={min_dist_pixel}"
+                f"metadata['physical_pixel_sizes']={metadata['physical_pixel_sizes']}, min_distance={self.config.min_distance}, min_dist_pixel={min_dist_pixel}"
             )
         else:
             min_dist_pixel = math.ceil(self.config.min_distance)
@@ -282,8 +285,7 @@ class Watershed(Configurable[WatershedConfig]):
         else:
             footprint = np.ones(footprint[-mask.ndim :])
         logger.info(f"footprint={footprint.shape}")
-        # last = int(np.max(mask))
-        # logger.info(f"last={last}")
+
         new_labels = np.zeros(mask.shape, dtype="uint32")
         last_label = 0
         values = [i for i in np.unique(mask) if i != 0]
