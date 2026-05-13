@@ -8,6 +8,7 @@ dependencies = [
     "pandas",
     "pydantic>=2.10",
     "scikit-image",
+    "scikit-learn",
     "scipy",
     "torch>=2.7",
     "torchvision",
