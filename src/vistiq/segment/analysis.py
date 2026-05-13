@@ -308,7 +308,7 @@ class RegionAnalyzer(StackProcessor):
 
         if spacing is not None:
             # Calculate physical area accounting for pixel spacing
-            pixel_area = np.abs(np.prod(spacing[-2]))
+            pixel_area = np.abs(np.prod(spacing[-2:]))
             return pixel_count * pixel_area
 
         return pixel_count
