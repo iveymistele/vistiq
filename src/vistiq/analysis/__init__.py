@@ -1,6 +1,11 @@
 from .coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
+    CoincidenceMethod,
+)
+from .coincidence_metrics import (
+    ALLOWED_COINCIDENCE_METRICS,
+    allowed_coincidence_metrics,
 )
 from .enrichment import (
     GridDensityFeaturesConfig,
@@ -12,8 +17,11 @@ from .enrichment import (
 )
 
 __all__ = [
+    "ALLOWED_COINCIDENCE_METRICS",
     "CoincidenceDetector",
     "CoincidenceDetectorConfig",
+    "CoincidenceMethod",
+    "allowed_coincidence_metrics",
     "GridDensityFeaturesConfig",
     "NeighborFeaturesConfig",
     "RegionDataFrameEnricher",

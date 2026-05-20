@@ -8,8 +8,29 @@ from vistiq.core import Configuration, Configurable, StackProcessorConfig, Stack
 from prefect import task
 from vistiq.workflow import Workflow
 from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
+from vistiq.analysis.coincidence_metrics import (
+    ALLOWED_COINCIDENCE_METRICS,
+    allowed_coincidence_metrics,
+    compute_bbox_metric,
+    compute_bbox_metric_via_masks,
+    compute_mask_metric,
+    mask_dice,
+    mask_iou,
+    metric_kind,
+)
 
 logger = logging.getLogger(__name__)
+
+CoincidenceMethod = Literal[
+    "iou",
+    "dice",
+    "enclosure",
+    "giou",
+    "diou",
+    "ciou",
+    "eiou",
+]
+
 
 class CoincidenceDetectorConfig(StackProcessorConfig):
     """Configuration for coincidence detection workflow.
@@ -17,15 +38,31 @@ class CoincidenceDetectorConfig(StackProcessorConfig):
     Attributes:
         output_type: Output type ("list" or "stack").
         output: Output fields ("score" or "above_threshold").
-        method: Overlap method to use ("iou" or "dice").
-        mode: Overlap mode ("box" or "strict").
+        method: Overlap metric name (see :func:`~vistiq.analysis.coincidence_metrics.allowed_coincidence_metrics`).
+        mode: ``outline`` uses pixel masks; ``bounding_box`` uses axis-aligned boxes (IoU-family metrics).
         threshold: Threshold for the overlap score (must be between 0.0 and 1.0).
     """
     output_type: Literal["list"] = Field(default="list", description="Output type")
     output: List[Literal["score", "above_threshold"]] = Field(default=["score", "above_threshold"], description="Output fields")
-    method: Literal["iou", "dice"] = Field(default="iou", description="Overlap method")
+    method: CoincidenceMethod = Field(default="iou", description="Coincidence / overlap metric")
     mode: Literal["bounding_box", "outline"] = Field(default="outline", description="Overlap mode")
     threshold: float = Field(default=0.5, description="Threshold for the overlap score")
+
+    @classmethod
+    def allowed_methods(cls) -> List[str]:
+        """Return sorted allowed coincidence metric names."""
+        return allowed_coincidence_metrics()
+
+    @field_validator("method")
+    @classmethod
+    def validate_method(cls, v: str) -> str:
+        """Validate method against the central coincidence metric registry."""
+        if v not in ALLOWED_COINCIDENCE_METRICS:
+            raise ValueError(
+                f"Invalid coincidence method '{v}'. "
+                f"Allowed methods are: {cls.allowed_methods()}"
+            )
+        return v
     
     @field_validator("threshold")
     @classmethod
@@ -58,46 +95,33 @@ class CoincidenceDetector(StackProcessor):
         super().__init__(config)
 
     def _iou(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
-        """Compute the Intersection Over Union (IoU) between two binary masks. It's equivalent to the Jaccard index.
-
-        Formula:
-            IoU = intersection / union
-            intersection = sum(mask1 & mask2)
-            union = sum(mask1 | mask2)
-
-        Args:
-            mask1: First binary mask.
-            mask2: Second binary mask.
-            
-        Returns:
-            IoU score between 0.0 and 1.0.
-        """
-        intersection = np.sum(mask1 & mask2)
-        union = np.sum(mask1 | mask2)
-        if union == 0:
-            return 0.0
-        return float(intersection / union)
+        """Compute IoU between binary masks (delegates to :func:`~vistiq.analysis.coincidence_metrics.mask_iou`)."""
+        return mask_iou(mask1, mask2)
 
     def _dice(self, mask1: np.ndarray, mask2: np.ndarray) -> float:
-        """Compute the Dice coefficient between two binary masks. It's equivalent to the F1 score.
+        """Compute Dice between binary masks (delegates to :func:`~vistiq.analysis.coincidence_metrics.mask_dice`)."""
+        return mask_dice(mask1, mask2)
 
-        Formula:
-            Dice = 2 * intersection / (sum(mask1) + sum(mask2))
-            intersection = sum(mask1 & mask2)
-            sum_masks = sum(mask1) + sum(mask2)
-
-        Args:
-            mask1: First binary mask.
-            mask2: Second binary mask.
-            
-        Returns:
-            Dice coefficient between 0.0 and 1.0.
-        """
-        intersection = np.sum(mask1 & mask2)
-        sum_masks = np.sum(mask1) + np.sum(mask2)
-        if sum_masks == 0:
-            return 0.0
-        return float(2 * intersection / sum_masks)
+    def _compute_overlap_score(
+        self,
+        mask1: np.ndarray,
+        mask2: np.ndarray,
+        bbox1: Tuple,
+        bbox2: Tuple,
+        union_bbox: Tuple,
+        sub_shape: Tuple[int, ...],
+    ) -> float:
+        """Compute overlap score for a region pair using config method and mode."""
+        method = self.config.method
+        if self.config.mode == "outline":
+            if metric_kind(method) == "bbox_2d":
+                return compute_bbox_metric(method, bbox1, bbox2)
+            return compute_mask_metric(method, mask1, mask2)
+        rel_bbox1 = self._bbox_to_relative(bbox1, union_bbox)
+        rel_bbox2 = self._bbox_to_relative(bbox2, union_bbox)
+        if method in ("iou", "dice"):
+            return compute_bbox_metric_via_masks(method, rel_bbox1, rel_bbox2, sub_shape)
+        return compute_bbox_metric(method, rel_bbox1, rel_bbox2)
     
     def _bbox_to_mask(self, bbox: Tuple, shape: Tuple) -> np.ndarray:
         """Create a binary mask from a bounding box.
@@ -134,39 +158,13 @@ class CoincidenceDetector(StackProcessor):
         return mask
     
     def _iou_box(self, bbox1: Tuple, bbox2: Tuple, shape: Tuple) -> float:
-        """Compute IoU between two bounding boxes by creating masks and using _iou.
-        
-        Args:
-            bbox1: Bounding box. For 2D: (min_row, min_col, max_row, max_col).
-                   For 3D: (min_row, min_col, min_slice, max_row, max_col, max_slice).
-            bbox2: Bounding box. Same format as bbox1.
-            shape: Shape of the full image. For 2D: (height, width).
-                   For 3D: (depth, height, width) or (height, width) if using 2D projection.
-            
-        Returns:
-            IoU score between 0.0 and 1.0.
-        """
-        mask1 = self._bbox_to_mask(bbox1, shape)
-        mask2 = self._bbox_to_mask(bbox2, shape)
-        return self._iou(mask1, mask2)
-    
+        """Compute IoU between two bounding boxes via filled masks (legacy helper)."""
+        return compute_bbox_metric_via_masks("iou", bbox1, bbox2, shape)
+
     def _dice_box(self, bbox1: Tuple, bbox2: Tuple, shape: Tuple) -> float:
-        """Compute Dice coefficient between two bounding boxes by creating masks and using _dice.
-        
-        Args:
-            bbox1: Bounding box. For 2D: (min_row, min_col, max_row, max_col).
-                   For 3D: (min_row, min_col, min_slice, max_row, max_col, max_slice).
-            bbox2: Bounding box. Same format as bbox1.
-            shape: Shape of the full image. For 2D: (height, width).
-                   For 3D: (depth, height, width) or (height, width) if using 2D projection.
-            
-        Returns:
-            Dice coefficient between 0.0 and 1.0.
-        """
-        mask1 = self._bbox_to_mask(bbox1, shape)
-        mask2 = self._bbox_to_mask(bbox2, shape)
-        return self._dice(mask1, mask2)
-    
+        """Compute Dice between two bounding boxes via filled masks (legacy helper)."""
+        return compute_bbox_metric_via_masks("dice", bbox1, bbox2, shape)
+
     def _extract_region(self, labels: np.ndarray, bbox: Tuple) -> np.ndarray:
         """Extract a sub-region from labels based on bounding box.
         
@@ -402,32 +400,29 @@ class CoincidenceDetector(StackProcessor):
                         logger.debug(f"Unique labels in sub_labels1: {np.unique(sub_labels1)}, looking for label {label1}")
                         logger.debug(f"Unique labels in sub_labels2: {np.unique(sub_labels2)}, looking for label {label2}")
                         
-                        # Create masks on the smaller sub-regions
-                        if self.config.mode == "outline":
-                            # Pixel-level overlap on sub-regions
-                            mask1 = (sub_labels1 == label1)
-                            mask2 = (sub_labels2 == label2)
-                            
-                            # Debug: Check if masks are empty
-                            logger.debug(f"mask1 sum: {np.sum(mask1)}, mask2 sum: {np.sum(mask2)}")
-                            if not np.any(mask1):
-                                logger.debug(f"Warning: mask1 for label {label1} is empty after extraction. Union bbox: {union_bbox}, bbox1: {bbox1}")
-                            if not np.any(mask2):
-                                logger.debug(f"Warning: mask2 for label {label2} is empty after extraction. Union bbox: {union_bbox}, bbox2: {bbox2}")
-                            
-                            if self.config.method == "iou":
-                                overlap_score = self._iou(mask1, mask2)
-                            else:  # dice
-                                overlap_score = self._dice(mask1, mask2)
-                        else:  # bounding_box mode
-                            # Convert bboxes to relative coordinates within the union bbox
-                            rel_bbox1 = self._bbox_to_relative(bbox1, union_bbox)
-                            rel_bbox2 = self._bbox_to_relative(bbox2, union_bbox)
-                            sub_shape = sub_labels1.shape
-                            if self.config.method == "iou":
-                                overlap_score = self._iou_box(rel_bbox1, rel_bbox2, sub_shape)
-                            else:  # dice
-                                overlap_score = self._dice_box(rel_bbox1, rel_bbox2, sub_shape)
+                        mask1 = (sub_labels1 == label1)
+                        mask2 = (sub_labels2 == label2)
+
+                        logger.debug(f"mask1 sum: {np.sum(mask1)}, mask2 sum: {np.sum(mask2)}")
+                        if not np.any(mask1):
+                            logger.debug(
+                                f"Warning: mask1 for label {label1} is empty after extraction. "
+                                f"Union bbox: {union_bbox}, bbox1: {bbox1}"
+                            )
+                        if not np.any(mask2):
+                            logger.debug(
+                                f"Warning: mask2 for label {label2} is empty after extraction. "
+                                f"Union bbox: {union_bbox}, bbox2: {bbox2}"
+                            )
+
+                        overlap_score = self._compute_overlap_score(
+                            mask1,
+                            mask2,
+                            bbox1,
+                            bbox2,
+                            union_bbox,
+                            sub_labels1.shape,
+                        )
                         logger.debug(f"Union bbox found for labels {label1} and {label2}, union_bbox: {union_bbox}, overlap_score: {overlap_score}")
                 
                 results.append({

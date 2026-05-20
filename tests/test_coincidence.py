@@ -2,8 +2,19 @@
 import numpy as np
 import pytest
 from vistiq.analysis import (
+    ALLOWED_COINCIDENCE_METRICS,
     CoincidenceDetectorConfig,
     CoincidenceDetector,
+    allowed_coincidence_metrics,
+)
+from vistiq.analysis.coincidence_metrics import (
+    bbox_enclosure,
+    bbox_giou,
+    bbox_iou,
+    compute_bbox_metric,
+    compute_mask_metric,
+    mask_enclosure,
+    mask_iou,
 )
 from vistiq.utils import ArrayIteratorConfig
 
@@ -41,6 +52,95 @@ class TestCoincidenceDetectorConfig:
         # Invalid threshold - too high
         with pytest.raises(Exception):  # Pydantic validation error
             CoincidenceDetectorConfig(threshold=1.5)
+
+    def test_method_validation_rejects_unknown(self):
+        """Test invalid method names are rejected."""
+        with pytest.raises(Exception):
+            CoincidenceDetectorConfig(method="jaccard")  # type: ignore[arg-type]
+
+    def test_allowed_methods_registry(self):
+        """Test registry contains all expected metric names."""
+        expected = {"iou", "dice", "enclosure", "giou", "diou", "ciou", "eiou"}
+        assert expected == ALLOWED_COINCIDENCE_METRICS
+        assert set(allowed_coincidence_metrics()) == expected
+        assert CoincidenceDetectorConfig.allowed_methods() == sorted(expected)
+
+    def test_custom_metric_config(self):
+        """Test detector accepts new metrics via config."""
+        config = CoincidenceDetectorConfig(method="enclosure", mode="outline")
+        assert config.method == "enclosure"
+
+
+class TestCoincidenceMetrics:
+    """Tests for coincidence metric registry functions."""
+
+    def test_mask_iou_perfect_and_no_overlap(self):
+        """Test mask IoU edge cases."""
+        a = np.array([[1, 1], [1, 1]], dtype=bool)
+        assert mask_iou(a, a) == 1.0
+        b = np.array([[0, 1], [0, 0]], dtype=bool)
+        c = np.array([[1, 0], [0, 0]], dtype=bool)
+        assert mask_iou(b, c) == 0.0
+
+    def test_mask_enclosure_containment(self):
+        """Test enclosure is 1.0 when smaller region is fully inside larger."""
+        outer = np.zeros((10, 10), dtype=bool)
+        outer[0:8, 0:8] = True
+        inner = np.zeros((10, 10), dtype=bool)
+        inner[2:5, 2:5] = True
+        assert mask_enclosure(outer, inner) == 1.0
+        assert mask_enclosure(inner, outer) == 1.0
+
+    def test_mask_enclosure_empty(self):
+        """Test enclosure with empty masks."""
+        empty = np.zeros((4, 4), dtype=bool)
+        filled = np.ones((4, 4), dtype=bool)
+        assert mask_enclosure(empty, filled) == 0.0
+
+    def test_bbox_iou_known_boxes(self):
+        """Test 2D bbox IoU on a simple overlapping pair."""
+        # 10x10 and 10x10 overlapping by 5x5 -> inter=25, union=175
+        box_a = (0.0, 0.0, 10.0, 10.0)
+        box_b = (5.0, 5.0, 15.0, 15.0)
+        iou = bbox_iou(box_a, box_b)
+        assert abs(iou - 25.0 / 175.0) < 1e-6
+
+    def test_bbox_enclosure_containment(self):
+        """Test bbox enclosure when one box contains the other."""
+        outer = (0.0, 0.0, 20.0, 20.0)
+        inner = (5.0, 5.0, 10.0, 10.0)
+        assert bbox_enclosure(outer, inner) == 1.0
+
+    def test_bbox_giou_geometry_identical_boxes(self):
+        """Geometry IoU is 0 when identical boxes fully occupy C."""
+        box = (1.0, 2.0, 5.0, 6.0)
+        assert bbox_giou(box, box) == 0.0
+
+    def test_bbox_giou_geometry_disjoint_boxes(self):
+        """Geometry IoU is high when boxes are small and separated inside C."""
+        box_a = (0.0, 0.0, 5.0, 5.0)  # area 25
+        box_b = (10.0, 10.0, 15.0, 15.0)  # area 25, no overlap
+        # C is 15x15 = 225, union = 50, exclusive = 175
+        assert abs(bbox_giou(box_a, box_b) - 175.0 / 225.0) < 1e-6
+
+    def test_bbox_metric_3d_raises(self):
+        """Test 2D-only bbox metrics reject 3D regionprops bboxes."""
+        box_3d = (0.0, 0.0, 0.0, 10.0, 10.0, 10.0)
+        box_2d = (0.0, 0.0, 10.0, 10.0)
+        with pytest.raises(ValueError, match="2D"):
+            compute_bbox_metric("giou", box_3d, box_2d)
+
+    def test_outline_giou_via_detector(self, sample_labels_2d):
+        """Test outline mode can use GIoU from region bounding boxes."""
+        labels1 = sample_labels_2d.copy()
+        labels2 = sample_labels_2d.copy()
+        config = CoincidenceDetectorConfig(method="giou", mode="outline")
+        detector = CoincidenceDetector(config)
+        results = detector._process_slice(labels1, labels2)
+        assert isinstance(results, list)
+        for result in results:
+            assert "score" in result
+            assert isinstance(result["score"], float)
 
 
 class TestCoincidenceDetector:
