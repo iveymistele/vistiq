@@ -1,36 +1,32 @@
-FROM pytorch/pytorch:latest
+FROM mambaorg/micromamba:1.5.10
+
 LABEL org.opencontainers.image.source="https://github.com/uvarc/vistiq"
 
 WORKDIR /opt/vistiq
 
+USER root
+
 RUN apt-get update && \
     apt-get install --no-install-recommends -y \
-    gpg \
-    git=1:2.* \
+    git \
     tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install UV from official image
-COPY --from=ghcr.io/astral-sh/uv:0.5.30 /uv /bin/uv
+COPY environment-gpu.yml .
+COPY . .
 
-# Copy the repository
-COPY . ./
+# Mac support
+ENV KMP_AFFINITY=disabled
 
-# Need to build sdist to dynamically set version with versioningit
-RUN rm -rf dist && \
-    uv build --sdist --out-dir dist
-RUN mv "dist/vistiq-"*".tar.gz" "dist/vistiq.tar.gz"
+RUN micromamba install -y -n base -f environment-gpu.yml && \
+    micromamba clean --all --yes
 
-# install from dist
-RUN uv pip install --system "./dist/vistiq.tar.gz" && \
-    rm -rf dist/
-    
-# Smoke test
-RUN vistiq -h
+SHELL ["micromamba", "run", "-n", "base", "/bin/bash", "-c"]
 
-# Setup entrypoint
+RUN python -c "import vistiq; print('vistiq import ok')" 
+
 COPY scripts/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
+
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/vistiq/entrypoint.sh"]
-
-
+CMD ["vistiq", "-h"]

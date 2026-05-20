@@ -1,0 +1,72 @@
+# Version control (not needed inside the image)
+#.git
+.gitattributes
+
+# CI / editor (shrinks build context)
+.github
+.idea
+.vscode
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Packaging / local installs
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments (never copy host venv into the image)
+.venv/
+venv/
+env/
+ENV/
+
+# Tests and coverage (image runs app, not pytest)
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+nosetests.xml
+.hypothesis/
+
+# Type / lint caches
+.mypy_cache/
+.ruff_cache/
+
+# Docs build artifacts
+docs/_build/
+site/
+
+# Logs and local artifacts (from .gitignore)
+*.log
+logs/
+embeddings/
+*report.html
+
+# Hatch / versioning local file when not checked in
+src/vistiq/_version.py
+
+# OS / Jupyter noise
+.DS_Store
+.ipynb_checkpoints/
+
+# Secrets 
+.env
+.env.*
+!.env.example
