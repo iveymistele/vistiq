@@ -1204,7 +1204,7 @@ class MicroSAMSegmenter(Segmenter):
             input_path=img,
             embedding_path=self.config.embedding_path,
         )
-        binary_mask = np.zeros_like(labels).astype(np.bool)
+        binary_mask = np.zeros_like(labels).astype(bool)
         binary_mask[labels > 0] = True
         if self.config.do_regions:
             regions = self.config.region_analyzer.run(labels, metadata=metadata)
