@@ -9,23 +9,47 @@ from skimage.transform import resize
 from joblib import Parallel, delayed
 import logging
 
-from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor, cli_config
+from vistiq.core import (
+    Configuration,
+    Configurable,
+    StackProcessorConfig,
+    StackProcessor,
+    cli_config,
+)
 from prefect import task
 
 logger = logging.getLogger(__name__)
 
-@cli_config(exclude=['output_type'])
+
+@cli_config(exclude=["output_type"])
 class PreprocessorConfig(StackProcessorConfig):
     """Configuration for image preprocessing operations.
 
     This configuration class defines parameters for preprocessing steps, e.g. normalization, denoising and Difference of Gaussians (DoG)
     filtering.
     """
+
     normalize: bool = Field(
-        default=True, description="Normalize output to [0, 1] range"
+        default=False, description="Normalize output to [0, 1] range"
     )
     output_type: Literal["stack"] = "stack"
-    dtype: Literal[int, np.uint8, np.uint32, np.uint64, float, np.float32, np.float64] | None = Field(default=None, description="dtype of processed stack. If None, same as input dtype.")
+    dtype: (
+        Literal[
+            bool,
+            int,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+            float,
+            np.float32,
+            np.float64,
+        ]
+        | None
+    ) = Field(
+        default=None,
+        description="dtype of processed stack. If None, same as input dtype.",
+    )
 
 
 class Preprocessor(StackProcessor):
@@ -68,42 +92,56 @@ class Preprocessor(StackProcessor):
         else:
             # All values are the same; set to 0
             stack = np.zeros_like(stack, dtype=np.float32)
-        logger.info(f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}")
+        logger.info(
+            f"Normalized stack with shape {stack.shape}, min:max {stack_min}:{stack_max} -> {np.min(stack)}:{np.max(stack)}"
+        )
         return stack.astype(np.float32, copy=False)
 
     @task(name="Preprocessor.run")
-    def run(self, stack: np.ndarray, *args, workers: int = 1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    def run(
+        self,
+        stack: np.ndarray,
+        *args,
+        workers: int = -1,
+        verbose: int = 10,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
-            
+
         Returns:
             Tuple of (processed image stack, updated metadata or None).
         """
         input_dtype = stack.dtype
-        logger.info(f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}")
-        preprocessed, updated_metadata = super().run(stack, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs)
+        logger.info(
+            f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}"
+        )
+        preprocessed, updated_metadata = super().run(
+            stack, *args, workers=workers, verbose=verbose, metadata=metadata, **kwargs
+        )
 
         # normalize
         if self.config.normalize:
             preprocessed = self.normalize(preprocessed)
-        
+
         # Determine output type
         if self.config.output_type is not None:
             dtype = self.config.dtype
         else:
             dtype = input_dtype
-        
+
         # Scale to the min/max range of the output type
         if np.issubdtype(dtype, np.integer):
             # For integer types, scale to [type_min, type_max]
             type_info = np.iinfo(dtype)
             type_min = type_info.min
             type_max = type_info.max
-            
+
             if self.config.normalize:
                 # Already normalized to [0, 1], just scale to output type range
                 preprocessed = preprocessed * (type_max - type_min) + type_min
@@ -116,8 +154,10 @@ class Preprocessor(StackProcessor):
                     preprocessed = preprocessed * (type_max - type_min) + type_min
                 else:
                     # All values are the same; set to middle of range
-                    preprocessed = np.full_like(preprocessed, (type_min + type_max) // 2, dtype=np.float64)
-            
+                    preprocessed = np.full_like(
+                        preprocessed, (type_min + type_max) // 2, dtype=np.float64
+                    )
+
             preprocessed = np.clip(preprocessed, type_min, type_max)
         elif np.issubdtype(dtype, np.floating):
             # For float types, if normalized, keep [0, 1] range
@@ -129,10 +169,11 @@ class Preprocessor(StackProcessor):
                     preprocessed = (preprocessed - stack_min) / (stack_max - stack_min)
                 else:
                     preprocessed = np.zeros_like(preprocessed, dtype=np.float32)
-        
+
         preprocessed = preprocessed.astype(dtype, copy=False)
-        
+
         return (preprocessed, updated_metadata)
+
 
 class PreprocessChainConfig(Configuration):
     """Configuration for chain of preprocessors.
@@ -169,18 +210,27 @@ class PreprocessChain(Configurable):
         return cls(config)
 
     @task(name="PreprocessChain.run")
-    def run(self, stack: np.ndarray, *args, workers: int = 1, verbose: int = 10, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    def run(
+        self,
+        stack: np.ndarray,
+        *args,
+        workers: int = 1,
+        verbose: int = 10,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Run the preprocess chain on an image stack.
 
         Args:
             stack: Input image stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
-            
+
         Returns:
             Tuple of (processed image stack, updated metadata or None).
         """
         return super().run(stack, *args, workers=workers, verbose=verbose)
+
 
 class DoG(Preprocessor):
     """Difference of Gaussians (DoG) filter for image processing.
@@ -249,6 +299,7 @@ class DoG(Preprocessor):
         """
         return super().run(*args, **kwargs)
 
+
 class DoGConfig(PreprocessorConfig):
     """Configuration for Difference of Gaussians (DoG) filtering operations.
 
@@ -265,8 +316,6 @@ class DoGConfig(PreprocessorConfig):
     mode: Literal["reflect", "constant", "nearest", "mirror", "wrap"] = Field(
         default="reflect", description="Border handling mode for Gaussian filtering"
     )
-
-
 
 
 class Noise2StackConfig(PreprocessorConfig):
@@ -294,9 +343,7 @@ class Noise2StackConfig(PreprocessorConfig):
     def validate_window_exclude_center(self) -> "Noise2StackConfig":
         """Validate that window is >= 2 when exclude_center is True."""
         if self.exclude_center and self.window < 2:
-            raise ValueError(
-                "window must be >= 2 when exclude_center=True"
-            )
+            raise ValueError("window must be >= 2 when exclude_center=True")
         return self
 
 
@@ -329,9 +376,7 @@ class Noise2Stack(Preprocessor):
         """
         return cls(config)
 
-    def denoise(
-        self, stack: np.ndarray
-    ) -> np.ndarray:
+    def denoise(self, stack: np.ndarray) -> np.ndarray:
         """Denoise an image stack by averaging temporal neighbors (Noise2Stack-inspired).
 
         This implements a simple, non-learning variant inspired by the Noise2Stack idea:
@@ -358,7 +403,9 @@ class Noise2Stack(Preprocessor):
         if window < 1:
             raise ValueError("denoise_window must be >= 1")
         if exclude_center and window < 2:
-            raise ValueError("denoise_window must be >= 2 when denoise_exclude_center=True")
+            raise ValueError(
+                "denoise_window must be >= 2 when denoise_exclude_center=True"
+            )
 
         input_dtype = stack.dtype
         work = stack.astype(np.float32, copy=False)
@@ -376,14 +423,18 @@ class Noise2Stack(Preprocessor):
         # Cast back to input dtype with clipping for integer types
         if np.issubdtype(input_dtype, np.integer):
             info = np.iinfo(input_dtype)
-            denoised = np.clip(denoised, info.min, info.max).astype(input_dtype, copy=False)
+            denoised = np.clip(denoised, info.min, info.max).astype(
+                input_dtype, copy=False
+            )
         else:
             denoised = denoised.astype(input_dtype, copy=False)
 
         return denoised
 
     @task(name="Noise2Stack.run")
-    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    def run(
+        self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Denoise an image stack by averaging temporal neighbors.
 
         This implements a simple, non-learning variant inspired by the Noise2Stack idea:
@@ -427,7 +478,9 @@ class Noise2Stack(Preprocessor):
         # Cast back to input dtype with clipping for integer types
         if np.issubdtype(input_dtype, np.integer):
             info = np.iinfo(input_dtype)
-            denoised = np.clip(denoised, info.min, info.max).astype(input_dtype, copy=False)
+            denoised = np.clip(denoised, info.min, info.max).astype(
+                input_dtype, copy=False
+            )
         else:
             denoised = denoised.astype(input_dtype, copy=False)
 
@@ -436,40 +489,47 @@ class Noise2Stack(Preprocessor):
 
 class ResizeConfig(PreprocessorConfig):
     """Configuration for image resizing operations.
-    
+
     This configuration class defines parameters for resizing image stacks.
     """
-    
+
     width: Optional[int] = Field(
-        default=None, description="Target width in pixels (None to maintain aspect ratio)"
+        default=None,
+        description="Target width in pixels (None to maintain aspect ratio)",
     )
     height: Optional[int] = Field(
-        default=None, description="Target height in pixels (None to maintain aspect ratio)"
+        default=None,
+        description="Target height in pixels (None to maintain aspect ratio)",
     )
     order: int = Field(
-        default=1, description="Spline interpolation order (0=nearest, 1=bilinear, 3=cubic)"
+        default=1,
+        description="Spline interpolation order (0=nearest, 1=bilinear, 3=cubic)",
     )
     preserve_range: bool = Field(
-        default=True, description="Preserve the original value range (True) or normalize to [0, 1] (False)"
+        default=True,
+        description="Preserve the original value range (True) or normalize to [0, 1] (False)",
     )
     anti_aliasing: bool = Field(
         default=True, description="Apply anti-aliasing when downsampling"
     )
-    
+    recompute_scale: bool = Field(
+        default=True, description="Recompute scale/physical dimensions of pixels/voxels"
+    )
+
     @field_validator("width", "height")
     @classmethod
     def validate_dimension(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 1:
             raise ValueError("width and height must be >= 1 if specified")
         return v
-    
+
     @field_validator("order")
     @classmethod
     def validate_order(cls, v: int) -> int:
         if v not in [0, 1, 3]:
             raise ValueError("order must be 0 (nearest), 1 (bilinear), or 3 (cubic)")
         return v
-    
+
     @model_validator(mode="after")
     def validate_dimensions(self) -> "ResizeConfig":
         """Validate that at least one dimension is specified."""
@@ -480,46 +540,48 @@ class ResizeConfig(PreprocessorConfig):
 
 class Resize(Preprocessor):
     """Image resizer for image stacks.
-    
+
     This class provides configurable resizing operations for image stacks,
     supporting both upsampling and downsampling with various interpolation methods.
     """
-    
+
     def __init__(self, config: ResizeConfig):
         """Initialize the resizer.
-        
+
         Args:
             config: Resize configuration.
         """
         super().__init__(config)
-    
+
     @classmethod
     def from_config(cls, config: ResizeConfig) -> "Resize":
         """Create a Resize instance from a configuration.
-        
+
         Args:
             config: Resize configuration.
-            
+
         Returns:
             A new Resize instance.
         """
         return cls(config)
-    
+
     def _process_slice(
         self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
         """Resize a single slice.
-        
+
         Args:
             slice: Input slice.
             metadata: Optional metadata (unused).
-            
+
         Returns:
             Resized slice.
         """
         original_shape = slice.shape
-        target_shape = self.config.output_shape[-len(original_shape):] #or list(original_shape)
-        
+        target_shape = self.config.output_shape[
+            -len(original_shape) :
+        ]  # or list(original_shape)
+
         # Resize the slice
         resized = resize(
             slice,
@@ -528,23 +590,25 @@ class Resize(Preprocessor):
             preserve_range=self.config.preserve_range,
             anti_aliasing=self.config.anti_aliasing,
         )
-        
+
         # Preserve dtype if preserve_range is True
         if self.config.preserve_range:
             resized = resized.astype(slice.dtype, copy=False)
-        
+
         logger.debug(f"Resized slice from {original_shape} to {resized.shape}")
         return resized
 
     @task(name="Resize.run")
-    def run(self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+    def run(
+        self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
         """Resize an image stack.
-        
+
         Args:
             stack: Input stack.
             metadata: Optional metadata to pass to the processor.
             **kwargs: Additional keyword arguments to pass to the processor.
-            
+
         Returns:
             Tuple of (resized stack, updated metadata or None).
         """
@@ -554,7 +618,7 @@ class Resize(Preprocessor):
         if self.config.width is not None and self.config.height is not None:
             # Both specified: use both
             target_shape[-2] = self.config.height  # Y dimension
-            target_shape[-1] = self.config.width   # X dimension
+            target_shape[-1] = self.config.width  # X dimension
         elif self.config.width is not None:
             # Only width specified: maintain aspect ratio
             aspect_ratio = original_shape[-1] / original_shape[-2]
@@ -565,14 +629,15 @@ class Resize(Preprocessor):
             aspect_ratio = original_shape[-1] / original_shape[-2]
             target_shape[-2] = self.config.height
             target_shape[-1] = int(self.config.height * aspect_ratio)
-        
+
         # Update config.output_shape using model_copy to ensure Pydantic validation
         # This allows _reshape_slice_results to use the correct output dimensions
-        if hasattr(self.config, 'model_copy'):
-            self.config = self.config.model_copy(update={"output_shape": tuple(target_shape)})
+        if hasattr(self.config, "model_copy"):
+            self.config = self.config.model_copy(
+                update={"output_shape": tuple(target_shape)}
+            )
         else:
             # Fallback for older Pydantic versions
             self.config.output_shape = tuple(target_shape)
         logger.info(f"RESIZING stack from {original_shape} to {target_shape}")
         return super().run(stack, metadata=metadata)
-

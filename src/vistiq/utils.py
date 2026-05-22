@@ -144,7 +144,7 @@ class ArrayIteratorConfig(Configuration):
         -1,
     )
 
-class VolumeStackIteratorConfig(Configuration):
+class VolumeStackIteratorConfig(ArrayIteratorConfig):
     """Configuration for array iteration over 3D volumes.
     
     Specifies which axes to keep (not iterate over) when processing 3D volumes.

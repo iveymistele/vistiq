@@ -1,9 +1,8 @@
 name: vistiq-env-gpu
 channels:
-  - conda-forge
   - nvidia
   - pytorch
-  - defaults
+  - conda-forge
 
 dependencies:
   - python=3.12
@@ -12,11 +11,6 @@ dependencies:
   - wheel
 
   # Core scientific/python stack
-  - numpy>=1.21
-  - pandas>=1.3.1
-  - scipy>=1.10
-  - scikit-image>=0.18.2
-  - matplotlib
   - joblib
   - tifffile
 
@@ -30,9 +24,6 @@ dependencies:
   - typer
 
   # GPU torch stack
-  - pytorch
-  - torchvision
-  - pytorch-cuda=12.1
 
   # Imaging / IO
   - bioio>=3.0.0
@@ -44,6 +35,16 @@ dependencies:
 
   - pip:
       - -e .
+      - cucim>=23.10.0
+      - cupy>=14.0.1
+      - torch 
+      - torchvision --index-url https://download.pytorch.org/whl/cu126
+      - numpy>=1.21
+      - pandas>=1.3.1
+      - scipy>=1.10
+      - scikit-image>=0.18.2
+      - matplotlib>=3.3
+      - bioio-base
       - bioio-lif>=1.4.1
       - bioio-tifffile>=1.3.0
       - bioio-nd2>=1.5.0

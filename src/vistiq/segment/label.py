@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -219,7 +220,7 @@ def remap_labels(
         (old_label, new_label) tuples.
     """
     labels = np.asarray(labels)
-    unique_labels = np.unique(labels, sorted=True)
+    unique_labels = np.unique(labels)  # sorted=True has been deprecated
     do_exclude = exclude is not None and len(exclude) > 0
     logger.debug(f"Unique labels: {unique_labels}, exclude={exclude}")
     if len(unique_labels) == 0:
@@ -1197,12 +1198,19 @@ class MicroSAMSegmenter(Segmenter):
             Regions: List of regions.
         """
         if self.config.embedding_path is None:
-            self.config.embedding_path = create_unique_folder(base_path="embeddings")
+            self.config.embedding_path = (
+                os.path.expanduser()
+            )  # create_unique_folder(base_path="embeddings")
+        arr_hash = hash(img.tobytes())
+        embedding_path = os.path.join(self.config.embedding_path, str(arr_hash))
+        os.makedirs(embedding_path, exist_ok=True)
+        logger.info(f"Using {embedding_path} for embeddings.")
+
         labels = automatic_instance_segmentation(
             predictor=self.config.predictor,
             segmenter=self.config.segmenter,
             input_path=img,
-            embedding_path=self.config.embedding_path,
+            embedding_path=embedding_path,
         )
         binary_mask = np.zeros_like(labels).astype(bool)
         binary_mask[labels > 0] = True

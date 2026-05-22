@@ -337,9 +337,12 @@ class StackProcessorConfig(Configuration):
     batch_size: PositiveInt = Field(
         default=10, description="Number of slices to process in parallel"
     )
+    preferred_backend: Literal["threads", "processes"] = "threads"
     tile_shape: Optional[Tuple[int, int]] = None
     output_type: Literal["stack", "list", "dataframe"] = "stack"
     output_shape: Optional[Tuple[int, ...]] = None
+    output_axes: Optional[Tuple[str, ...]] = None
+    recompute_scale: Optional[bool] = False
     squeeze: bool = True
     split_axis: Optional[Union[int, str]] = Field(
         default=None,
@@ -401,7 +404,7 @@ class StackProcessor(Configurable):
         self,
         stack: np.ndarray,
         *args,
-        workers: int = 1,
+        workers: int = -1,
         verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
@@ -433,7 +436,10 @@ class StackProcessor(Configurable):
                 f"Using Parallel with n_jobs={workers} for {n_iterations} iterations"
             )
             results = Parallel(
-                n_jobs=workers, verbose=verbose, batch_size=self.config.batch_size
+                n_jobs=workers,
+                verbose=verbose,
+                batch_size=self.config.batch_size,
+                prefer=self.config.preferred_backend,
             )(
                 delayed(self._process_slice)(
                     stack_slice, *args, metadata=metadata, **kwargs
@@ -467,6 +473,7 @@ class StackProcessor(Configurable):
                 if "axes" in new_metadata and new_metadata["axes"]:
                     new_metadata["axes"] = list(new_metadata["axes"])[-new.size :]
                     axes = new_metadata.get("axes", [])
+                    logger.info(f"Dropping axes. New axes: {axes}")
             else:
                 # Pad orig with leading ones to align
                 orig = np.pad(
@@ -475,6 +482,15 @@ class StackProcessor(Configurable):
                     mode="constant",
                     constant_values=1.0,
                 )
+                if "axes" in new_metadata and new_metadata["axes"]:
+                    if self.config.output_axes is not None:
+                        axes = self.config.output_axes
+                    else:
+                        axes = [
+                            chr(ord("A") + i)
+                            for i in range(len(new_shape) - len(orig_shape))
+                        ] + new_metadata["axes"]
+                    logger.info(f"Adding axes. New axes: {axes}")
 
         change = orig / new
 
@@ -492,6 +508,7 @@ class StackProcessor(Configurable):
             if axes:
                 # Use axes list directly (Dimensions accepts list or string)
                 new_metadata["dims"] = Dimensions(axes, tuple(new_shape))
+                new_metadata["dim_order"] = "".join(axes)
             else:
                 # Try to preserve existing dims structure if possible
                 if hasattr(new_metadata["dims"], "order"):
@@ -503,6 +520,7 @@ class StackProcessor(Configurable):
                         [chr(ord("A") + i) for i in range(len(new_shape))]
                     )
                     new_metadata["dims"] = Dimensions(dim_order, tuple(new_shape))
+                new_metadata["dim_order"] = dim_order
 
         if not axes:
             logger.warning(
@@ -510,56 +528,83 @@ class StackProcessor(Configurable):
             )
             return new_metadata
 
-        # Update scale: multiply each axis's scale value by the corresponding change ratio
-        if "scale" in new_metadata and new_metadata["scale"] is not None:
-            scale_dict = new_metadata["scale"]._asdict()
-            # Map each dimension in change to its axis letter and update the scale
-            for i, axis_letter in enumerate(axes):
-                if (
-                    i < len(change)
-                    and axis_letter in scale_dict
-                    and scale_dict[axis_letter] is not None
-                ):
-                    scale_dict[axis_letter] = float(scale_dict[axis_letter] * change[i])
-            new_metadata["scale"] = Scale(**scale_dict)
+        if self.config.recompute_scale:
+            # Update scale: multiply each axis's scale value by the corresponding change ratio
+            if "scale" in new_metadata and new_metadata["scale"] is not None:
+                scale_dict = new_metadata["scale"]._asdict()
+                # Map each dimension in change to its axis letter and update the scale
+                for i, axis_letter in enumerate(axes):
+                    if (
+                        i < len(change)
+                        and axis_letter in scale_dict
+                        and scale_dict[axis_letter] is not None
+                    ):
+                        scale_dict[axis_letter] = float(
+                            scale_dict[axis_letter] * change[i]
+                        )
+                    else:
+                        scale_dict[axis_letter] = None
+                new_metadata["scale"] = Scale(**scale_dict)
 
-        # Update physical_pixel_sizes: multiply each axis's pixel size by the corresponding change ratio
-        pps_dict = None
-        if (
-            "physical_pixel_sizes" in new_metadata
-            and new_metadata["physical_pixel_sizes"] is not None
-        ):
-            pps = new_metadata["physical_pixel_sizes"]
-            # Handle both namedtuple and other types
-            if hasattr(pps, "_asdict"):
-                pps_dict = pps._asdict()
-                # Map each dimension in change to its axis letter and update the pixel sizes
-                for i, axis_letter in enumerate(axes):
-                    if (
-                        i < len(change)
-                        and axis_letter in pps_dict
-                        and pps_dict[axis_letter] is not None
-                    ):
-                        pps_dict[axis_letter] = float(pps_dict[axis_letter] * change[i])
-                # Reconstruct the namedtuple with the same type
-                new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
-            elif hasattr(pps, "_fields"):
-                # It's a namedtuple, use _fields to get field names
-                pps_dict = pps._asdict()
-                for i, axis_letter in enumerate(axes):
-                    if (
-                        i < len(change)
-                        and axis_letter in pps_dict
-                        and pps_dict[axis_letter] is not None
-                    ):
-                        pps_dict[axis_letter] = float(pps_dict[axis_letter] * change[i])
-                new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
-            else:
-                logger.warning(
-                    f"Cannot update physical_pixel_sizes: unsupported type {type(pps)}"
-                )
+            # Update physical_pixel_sizes: multiply each axis's pixel size by the corresponding change ratio
+            pps_dict = None
+            if (
+                "physical_pixel_sizes" in new_metadata
+                and new_metadata["physical_pixel_sizes"] is not None
+            ):
+                pps = new_metadata["physical_pixel_sizes"]
+                # Handle both namedtuple and other types
+                if hasattr(pps, "_asdict"):
+                    pps_dict = pps._asdict()
+                    # Map each dimension in change to its axis letter and update the pixel sizes
+                    for i, axis_letter in enumerate(axes):
+                        if (
+                            i < len(change)
+                            and axis_letter in pps_dict
+                            and pps_dict[axis_letter] is not None
+                        ):
+                            pps_dict[axis_letter] = float(
+                                pps_dict[axis_letter] * change[i]
+                            )
+                    # Reconstruct the namedtuple with the same type
+                    new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
+                elif hasattr(pps, "_fields"):
+                    # It's a namedtuple, use _fields to get field names
+                    pps_dict = pps._asdict()
+                    for i, axis_letter in enumerate(axes):
+                        if (
+                            i < len(change)
+                            and axis_letter in pps_dict
+                            and pps_dict[axis_letter] is not None
+                        ):
+                            pps_dict[axis_letter] = float(
+                                pps_dict[axis_letter] * change[i]
+                            )
+                        else:
+                            pps_dict[axis_letter] = None
+                    new_metadata["physical_pixel_sizes"] = type(pps)(**pps_dict)
+                else:
+                    logger.warning(
+                        f"Cannot update physical_pixel_sizes: unsupported type {type(pps)}"
+                    )
 
         return new_metadata
+
+    def _axis_index(self, metadata, letter: str) -> int:
+        if metadata is None or letter is None or letter not in metadata.get("axes"):
+            if self.config.strict_axis:
+                raise ValueError(
+                    f"{letter} not found in axis labels. Available axis labels: {metadata.get('axes')}"
+                )
+            return None
+        else:
+            return metadata["axes"].index(letter)
+
+    def _axis_letter(self, metadata, index: int) -> str:
+        if metadata is None or index < 0 or index >= len(metadata.get("axes")):
+            return None
+        else:
+            return metadata.get("axes")[index]
 
     def _update_metadata(
         self, stack, results, *args, metadata: Optional[dict[str, Any]] = None, **kwargs
@@ -677,7 +722,7 @@ class StackProcessor(Configurable):
                 logger.info(f"Not reshaping results, type(results)={type(results)}")
             #    results = [list(item) for item in results]
         elif self.config.output_type == "dataframe":
-            results = pd.concat(results, ignore_index=True)
+            results = pd.concat(results, ignore_index=True).set_index("label")
         return results
 
 
