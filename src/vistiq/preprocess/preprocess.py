@@ -4,6 +4,9 @@ import numpy as np
 from typing import Optional, Literal, Any
 from pydantic import Field, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
+from skimage.exposure import rescale_intensity
+
+# segmentation, draw
 from skimage.filters import gaussian
 from skimage.transform import resize
 from joblib import Parallel, delayed
@@ -639,5 +642,27 @@ class Resize(Preprocessor):
         else:
             # Fallback for older Pydantic versions
             self.config.output_shape = tuple(target_shape)
-        logger.info(f"RESIZING stack from {original_shape} to {target_shape}")
+        logger.info(f"Resizing stack from {original_shape} to {target_shape}")
         return super().run(stack, metadata=metadata)
+
+
+class RescaleConfig(PreprocessorConfig):
+
+    low: float = 0.0
+    high: float = 100.0
+
+
+class Rescale(Preprocessor):
+
+    def __init__(self, config: RescaleConfig):
+        super().__init__(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        plow, phigh = np.percentile(slice, (self.config.low, self.config.high))
+        logger.debug(plow, phigh)
+        scaled = rescale_intensity(
+            slice, out_range=self.config.dtype, in_range=(plow, phigh)
+        )
+        return scaled

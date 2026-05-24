@@ -800,3 +800,124 @@ class ChainProcessor(Configurable[ChainProcessorConfig]):
                 **kwargs,
             )
         return result
+
+
+class TilerConfig(StackProcessorConfig):
+
+    factor: Tuple[int, ...]
+    pad_width: Union[
+        int, Tuple[Tuple[int, int]], dict[int, Union[int, Tuple[int, int]]]
+    ] = None
+    pad_kwargs: dict[str, Any] = {"mode": "constant", "constant_values": 0}
+    alt_flip: bool = False
+    iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=())
+
+
+class Tiler(StackProcessor):
+
+    def __init__(self, config: TilerConfig):
+        super().__init__(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        factor = self.config.factor
+        if self.config.alt_flip:
+            import math
+
+            orig_y, orig_x = slice.shape[-2:]
+            top_row = np.hstack((slice, np.fliplr(slice)))
+            bottom_row = np.flipud(top_row)
+            block = np.vstack((top_row, bottom_row))
+            n_x = int(math.ceil(factor[-1] / 2))
+            n_y = int(math.ceil(factor[-2] / 2))
+            tiled = np.tile(block, (n_y, n_x))
+            start_x = tiled.shape[-1] - (factor[-1] * orig_x)
+            start_y = tiled.shape[-1] - (factor[-2] * orig_x)
+            tiled = tiled[..., start_y:, start_x:]
+            print(slice.shape, orig_y, orig_x, n_x, n_y, tiled.shape)
+        else:
+            tiled = np.tile(slice, factor)
+        return tiled
+
+    def run(self, stack, *args, metadata: Optional[dict[str, Any]] = None, **kwargs):
+        if self.config.pad_width is not None:
+            stack = np.pad(
+                stack, pad_width=self.config.pad_width, **self.config.pad_kwargs
+            )
+        return super().run(stack, *args, metadata=metadata, **kwargs)
+
+
+class UntilerConfig(StackProcessorConfig):
+
+    factor: Tuple[int, ...] = (1, 1)
+
+
+class Untiler(StackProcessor):
+
+    def __init__(self, config: UntilerConfig):
+        super().__init__(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        factor = self.config.factor
+        assert len(factor) == 2
+        import math
+
+        resized = tuple(size_in // f for size_in, f in zip(slice.shape[-2:], factor))
+
+        vs = np.array(np.split(slice, factor[-1], axis=-1))
+        hs = np.array(np.split(vs, factor[-2], axis=-2))
+        untiled = hs.reshape((math.prod(factor), *slice.shape[:-2], *resized))
+        logger.info(
+            f"factor={factor}, array.shape={slice.shape}, vs.shape={vs.shape}, hs.shape={hs.shape}, untiled.shape={untiled.shape}"
+        )
+        return untiled
+
+
+class FuncProcessorConfig(StackProcessorConfig):
+
+    iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=())
+    strict_axis: bool = True
+    dtype: Literal[
+        np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool
+    ] = None
+    func: Any = None
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+
+
+class FuncProcessor(StackProcessor):
+
+    def __init__(self, config: FuncProcessorConfig):
+        super().__init__(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        func = self.config.func
+        args = self.config.args
+        kwargs = self.config.kwargs.copy()
+        if "axis" in kwargs:
+            axis_letters = kwargs["axis"]
+            axis_indices = tuple(
+                [
+                    (
+                        self._axis_index(metadata, letter)
+                        if isinstance(letter, str)
+                        else letter
+                    )
+                    for letter in axis_letters
+                ]
+            )
+            axis_indices = tuple([i for i in axis_indices if i is not None])
+            kwargs["axis"] = axis_indices
+            logger.info(
+                f"Mapped axis letters {axis_letters} to axis indices {axis_indices}"
+            )
+        results = func(slice, *args, **kwargs)
+        if self.config.dtype is not None and isinstance(results, np.ndarray):
+            results = results.astype(self.config.dtype)
+            logger.info(f"Converted results to {results.dtype}")
+        return results

@@ -28,6 +28,8 @@ from vistiq.segment.select import (
     RegionFilterConfig,
 )
 from vistiq.segment.label import (
+    SegmentationFlow,
+    SegmentationFlowConfig,
     IterativeSegmenter,
     IterativeSegmenterConfig,
     LabelRemover,

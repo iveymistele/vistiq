@@ -9,6 +9,8 @@ from vistiq.preprocess.preprocess import (
     PreprocessChainConfig,
     Preprocessor,
     PreprocessorConfig,
+    Rescale,
+    RescaleConfig,
     Resize,
     ResizeConfig,
 )

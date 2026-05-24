@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from pydantic import field_validator, model_validator
 from prefect import task
-from skimage.measure import label as sk_label, regionprops, regionprops_table
+from skimage.measure import label as sk_label, regionprops, regionprops_table, perimeter
 
 from vistiq.core import StackProcessor, StackProcessorConfig
 from vistiq.segment._debug import debug_mask_labels
@@ -172,7 +172,8 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Circularity value (1.0 for perfect circle), or NaN if invalid.
         """
-        from skimage.measure import perimeter
+        if regionmask.ndim == 3:
+            return float("nan")
 
         perim = perimeter(regionmask)
         area = np.sum(regionmask)
@@ -195,6 +196,9 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Sphericity value (1.0 for perfect sphere), or NaN if invalid.
         """
+        if regionmask.ndim == 2:
+            return float("nan")
+
         volume = np.sum(regionmask)
         if volume == 0:
             return float("nan")
@@ -334,6 +338,9 @@ class RegionAnalyzer(StackProcessor):
             Volume as a float. If spacing is provided, returns physical volume.
             Otherwise, returns number of pixels/voxels.
         """
+        if regionmask.ndim == 2:
+            return float("nan")
+
         pixel_count = float(np.sum(regionmask))
 
         if spacing is not None:
@@ -428,8 +435,6 @@ class RegionAnalyzer(StackProcessor):
     def run(
         self,
         labels: np.ndarray,
-        workers: int = -1,
-        verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> List["RegionProperties"] | pd.DataFrame:
@@ -445,10 +450,8 @@ class RegionAnalyzer(StackProcessor):
         """
         logger.debug("DEBUG: entered RegionAnalyzer.run")
         logger.debug("DEBUG: labels shape =", getattr(labels, "shape", None))
-        debug_mask_labels("RegionAnalyzer.run", labels)
-        results = super().run(
-            labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs
-        )
+        # debug_mask_labels("RegionAnalyzer.run", labels)
+        results = super().run(labels, metadata=metadata, **kwargs)
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
         return results[0]
 
