@@ -643,7 +643,7 @@ class Resize(Preprocessor):
             # Fallback for older Pydantic versions
             self.config.output_shape = tuple(target_shape)
         logger.info(f"Resizing stack from {original_shape} to {target_shape}")
-        return super().run(stack, metadata=metadata)
+        return super().run(stack, metadata=metadata, **kwargs)
 
 
 class RescaleConfig(PreprocessorConfig):

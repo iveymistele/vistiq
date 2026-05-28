@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union, TYPE_CHECKING
-from pydantic import BaseModel, PositiveInt, Field, field_validator
+from pydantic import BaseModel, PositiveInt, Field, field_validator, ImportString
 
 # from pydantic.dataclasses import dataclass
 import numpy as np
@@ -20,6 +20,15 @@ ConfigType = TypeVar("ConfigType", bound="Configuration")
 
 if TYPE_CHECKING:
     from typing import Type
+
+
+def generate_name(parameters) -> str:
+    if "func" in parameters["self"].config.model_fields_set:
+        func_ref = parameters["self"].config.func
+        func_name = f"{func_ref.__module__}.{func_ref.__qualname__}"
+        return f"{parameters["self"].name()}: {func_name}"
+    else:
+        return parameters["self"].name()
 
 
 def cli_field(
@@ -187,10 +196,10 @@ class Configuration(BaseModel):
     Subclasses should extend this to define specific configuration parameters.
     """
 
-    classname: str | None = None
-    package: str | None = None
-    version: str | None = None
-    command_group: str | None = None
+    classname: ImportString = Field(default="Configurable")
+    package: ImportString = Field(default="vistiq.core")
+    version: str = Field(default=None)
+    command_group: str = Field(default=None)
 
     class Config:
         """Pydantic configuration.
@@ -226,6 +235,7 @@ class Configurable(ABC, Generic[ConfigType]):
         self.config = config
         # Update config with class metadata using Pydantic's model_copy
         # Get version from package if class doesn't have it
+        """
         version = getattr(type(self), "__version__", None)
         if version is None:
             # Try to get version from the package
@@ -240,16 +250,17 @@ class Configurable(ABC, Generic[ConfigType]):
         if hasattr(self.config, "model_copy"):
             self.config = self.config.model_copy(
                 update={
-                    "classname": type(self.config).__name__,
-                    "package": type(self.config).__module__,
+                    "classname": f"{self.__module__}.{self.__name__}", # type(self.config).__name__,
+                    "package": f"{self.__module__}", # type(self.config).__module__,
                     "version": version,
                 }
             )
         else:
             # Fallback: directly assign if model_copy not available
-            self.config.classname = type(self.config).__name__
-            self.config.package = type(self.config).__module__
+            self.config.classname = f"{self.__module__}.{self.__name__}" # type(self.config).__name__
+            self.config.package = f"{self.__module__}" # type(self.config).__module__
             self.config.version = version
+        """
 
     @classmethod
     @abstractmethod
@@ -399,7 +410,7 @@ class StackProcessor(Configurable):
         """
         return cls(config)
 
-    @task(name="StackProcessor.run")
+    @task(name="StackProcessor.run", task_run_name=generate_name)
     def run(
         self,
         stack: np.ndarray,
@@ -840,10 +851,41 @@ class Tiler(StackProcessor):
             tiled = np.tile(slice, factor)
         return tiled
 
+    def _resolve_pad_width(self, ndim: int):
+        pad_width = self.config.pad_width
+        if pad_width is None:
+            return None
+        if isinstance(pad_width, dict):
+            normalized = [(0, 0)] * ndim
+            for axis, axis_pad in pad_width.items():
+                axis_idx = int(axis)
+                if axis_idx < 0:
+                    axis_idx += ndim
+                if axis_idx < 0 or axis_idx >= ndim:
+                    raise ValueError(
+                        f"pad_width axis {axis} is out of bounds for array with ndim={ndim}"
+                    )
+
+                if isinstance(axis_pad, int):
+                    normalized[axis_idx] = (axis_pad, axis_pad)
+                elif (
+                    isinstance(axis_pad, (tuple, list))
+                    and len(axis_pad) == 2
+                    and all(isinstance(v, int) for v in axis_pad)
+                ):
+                    normalized[axis_idx] = (int(axis_pad[0]), int(axis_pad[1]))
+                else:
+                    raise ValueError(
+                        f"Invalid pad spec for axis {axis}: {axis_pad}. Expected int or (before, after) ints."
+                    )
+            return tuple(normalized)
+        return pad_width
+
     def run(self, stack, *args, metadata: Optional[dict[str, Any]] = None, **kwargs):
         if self.config.pad_width is not None:
+            pad_width = self._resolve_pad_width(stack.ndim)
             stack = np.pad(
-                stack, pad_width=self.config.pad_width, **self.config.pad_kwargs
+                stack, pad_width=pad_width, **self.config.pad_kwargs
             )
         return super().run(stack, *args, metadata=metadata, **kwargs)
 
@@ -883,7 +925,7 @@ class FuncProcessorConfig(StackProcessorConfig):
     dtype: Literal[
         np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool
     ] = None
-    func: Any = None
+    func: ImportString = None
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
 

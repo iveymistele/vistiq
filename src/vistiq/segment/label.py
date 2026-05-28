@@ -1,35 +1,53 @@
 import logging
 import os
+import math
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import supervision as sv
+
 from micro_sam.automatic_segmentation import (
     automatic_instance_segmentation,
     get_predictor_and_segmenter,
 )
+from micro_sam.multi_dimensional_segmentation import merge_instance_segmentation_3d
+
 from prefect import task, flow
 from pydantic import field_validator, model_validator, PositiveInt
 from skimage.measure import label as sk_label
 
 from vistiq.core import (
-    Configuration,
     StackProcessor,
     StackProcessorConfig,
+    FuncProcessor, 
+    FuncProcessorConfig,
+    Tiler,
+    TilerConfig,
+    Untiler,
+    UntilerConfig,
 )
-from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
+from vistiq.utils import (
+    ArrayIterator,
+    ArrayIteratorConfig,
+    array_content_digest,
+    create_unique_folder,
+)
+from vistiq.preprocess import (
+    Resize, 
+    ResizeConfig, 
+)
+
 from vistiq.workflow import Workflow, WorkflowConfig
 
 from vistiq.segment._debug import debug_mask_labels
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.segment.postprocess import (
     BinaryProcessor,
-    BinaryProcessorConfig,
     dilate_regions,
 )
 from vistiq.segment.select import (
     RegionFilter,
-    RegionFilterConfig,
 )
 from vistiq.segment.threshold import (
     OtsuThreshold,
@@ -38,6 +56,162 @@ from vistiq.segment.threshold import (
 )
 
 logger = logging.getLogger(__name__)
+
+def box_iou_batch_3d(
+    boxes_true: np.typing.NDArray[np.number],
+    boxes_detection: np.typing.NDArray[np.number],
+    overlap_metric: Literal["IOU", "IOS"] = "IOU"
+) -> np.ndarray[np.float32]:
+    """
+    Adapted for 3d from https://github.com/roboflow/supervision/blob/develop/src/supervision/detection/utils/iou_and_nms.py
+    
+    Compute pairwise overlap scores between batches of bounding boxes.
+
+    Supports standard IOU (intersection-over-union) and IOS
+    (intersection-over-smaller-area) metrics for all `boxes_true` and
+    `boxes_detection` pairs. Returns a matrix of overlap values in range
+    `[0, 1]`, matching each box from the first batch to each from the second.
+
+    Args:
+        boxes_true: Array of reference boxes in
+            shape `(N, 4)` as `(x_min, y_min, z_min, x_max, y_max, z_max)`.
+        boxes_detection: Array of detected boxes in
+            shape `(M, 4)` as `(x_min, y_min, z_min, x_max, y_max, z_min)`.
+        overlap_metric: Overlap type.
+            Use `OverlapMetric.IOU` for intersection-over-union,
+            `OverlapMetric.IOS` for intersection-over-smaller-area.
+            Defaults to `OverlapMetric.IOU`.
+
+    Returns:
+        Overlap matrix of shape `(N, M)`, where entry
+            `[i, j]` is the overlap between `boxes_true[i]` and
+            `boxes_detection[j]`.
+
+    Raises:
+        ValueError: If `overlap_metric` is not IOU or IOS.
+
+    Examples:
+        ```pycon
+        >>> import numpy as np
+        >>> import supervision as sv
+        >>> boxes_true = np.array([
+        ...     [100, 100, 200, 200],
+        ...     [300, 300, 400, 400]
+        ... ])
+        >>> boxes_detection = np.array([
+        ...     [150, 150, 250, 250],
+        ...     [320, 320, 420, 420]
+        ... ])
+        >>> sv.box_iou_batch_3d(
+        ...     boxes_true, boxes_detection, overlap_metric=sv.OverlapMetric.IOU
+        ... )
+        array([[0.14285..., 0.        ],
+               [0.        , 0.47058...]], dtype=float32)
+        >>> sv.box_iou_batch(
+        ...     boxes_true, boxes_detection, overlap_metric=sv.OverlapMetric.IOS
+        ... )
+        array([[0.25, 0.  ],
+               [0.  , 0.64]], dtype=float32)
+
+        ```
+    """
+    #overlap_metric = OverlapMetric.from_value(overlap_metric)
+    x_min_true, y_min_true, z_min_true, x_max_true, y_max_true, z_max_true = boxes_true.T
+    x_min_det, y_min_det, z_min_det, x_max_det, y_max_det, z_max_det = boxes_detection.T
+    count_true, count_det = boxes_true.shape[0], boxes_detection.shape[0]
+
+    if count_true == 0 or count_det == 0:
+        return cast(
+            np.typing.NDArray[np.float32], np.empty((count_true, count_det), dtype=np.float32)
+        )
+
+    x_min_inter = np.empty((count_true, count_det), dtype=np.float32)
+    x_max_inter = np.empty_like(x_min_inter)
+    y_min_inter = np.empty_like(x_min_inter)
+    y_max_inter = np.empty_like(x_min_inter)
+    z_min_inter = np.empty_like(x_min_inter)
+    z_max_inter = np.empty_like(x_min_inter)
+
+    np.maximum(x_min_true[:, None], x_min_det[None, :], out=x_min_inter)
+    np.minimum(x_max_true[:, None], x_max_det[None, :], out=x_max_inter)
+    np.maximum(y_min_true[:, None], y_min_det[None, :], out=y_min_inter)
+    np.minimum(y_max_true[:, None], y_max_det[None, :], out=y_max_inter)
+    np.maximum(z_min_true[:, None], z_min_det[None, :], out=z_min_inter)
+    np.minimum(z_max_true[:, None], z_max_det[None, :], out=z_max_inter)
+
+    # we reuse x_max_inter and y_max_inter to store inter_w, inter_h and inter_d
+    np.subtract(x_max_inter, x_min_inter, out=x_max_inter)  # inter_w
+    np.subtract(y_max_inter, y_min_inter, out=y_max_inter)  # inter_h
+    np.subtract(z_max_inter, z_min_inter, out=z_max_inter)  # inter_d
+    np.clip(x_max_inter, 0.0, None, out=x_max_inter)
+    np.clip(y_max_inter, 0.0, None, out=y_max_inter)
+    np.clip(z_max_inter, 0.0, None, out=z_max_inter)
+
+    area_inter = x_max_inter * y_max_inter * z_max_inter # inter_w * inter_h * inter_d
+
+    area_true = (x_max_true - x_min_true) * (y_max_true - y_min_true) * (z_max_true - z_min_true)
+    area_det = (x_max_det - x_min_det) * (y_max_det - y_min_det)  * (z_max_det - z_min_det)
+
+    if overlap_metric == "IOU":
+        area_norm = area_true[:, None] + area_det[None, :] - area_inter
+    elif overlap_metric == "IOS":
+        area_norm = np.minimum(area_true[:, None], area_det[None, :])
+    else:
+        raise ValueError(
+            f"overlap_metric {overlap_metric} is not supported, "
+            "only 'IOU' and 'IOS' are supported"
+        )
+
+    out: np.ndarray[np.float32] = np.zeros_like(area_inter, dtype=np.float32)
+    np.divide(area_inter, area_norm, out=out, where=area_norm > 0)
+    return out
+
+
+def labels_to_masks(labels):
+    label_values = (v for v in np.unique(labels) if v > 0)
+    masks = []
+    for value in label_values:
+        mask = labels == value
+        masks.append(mask)
+    return np.array(masks)
+
+
+def group_bboxes(bboxes, divisor=1, threshold=0.5):
+    
+    def in_groups(item, groups):
+        for g in groups:
+            if item in g:
+                return True
+        return False
+    
+    xyxy = np.mod(bboxes, divisor)
+    #print (xyxy[:7])
+    if len(bboxes[0]) == 4:
+        iou_matrix = sv.box_iou_batch(xyxy, xyxy, overlap_metric=sv.OverlapMetric.IOU)
+    elif len(bboxes[0]) == 6:
+        iou_matrix = box_iou_batch_3d(xyxy, xyxy, overlap_metric="IOU")
+    #print (iou_matrix)
+    iou_matrix = np.triu(iou_matrix, k=1)
+    pairs = np.argwhere(iou_matrix > threshold)
+    
+    groups = []
+    for i, pair in enumerate(pairs):
+        p0 = pair[0]
+        #print (i, p0, p1, iou_matrix[p0, p1])
+        if not in_groups(p0, groups):
+            pairs_with_p0 = np.unique(np.array([p for p in pairs if p[0] == p0]).flatten())
+            logger.info(f"Creating new group with {pairs_with_p0}")
+            groups.append(pairs_with_p0)
+    return groups
+
+
+def label_grouped_mask(mask:np.ndarray, groups:list[np.ndarray], threshold:float=0.5, dtype:str="uint64"):
+    labels = []
+    for label_value, g in enumerate(groups, 1):
+        label_array = (mask[g].mean(axis=0)>threshold) * label_value
+        labels.append(label_array)
+    labels = np.sum(np.array(labels), axis=0).astype(dtype)
+    return labels
 
 
 class SegmenterConfig(StackProcessorConfig):
@@ -50,6 +224,7 @@ class Segmenter(StackProcessor):
     def __init__(self, config: SegmenterConfig):
         super().__init__(config)
 
+    @task(name="Segmenter.run")
     def run(
         self,
         stack: np.ndarray,
@@ -74,19 +249,168 @@ class Segmenter(StackProcessor):
 
 
 class MergerConfig(StackProcessorConfig):
-    pass
+    """Configuration for label-stack merging.
+
+    Base configuration for :class:`Merger` and its subclasses. Mergers operate on
+    label arrays after slice-wise segmentation, linking instances across the stack
+    axis into a single consistent volume.
+
+    Defaults are tuned for processing a full label volume in one pass rather than
+    iterating over individual slices.
+
+    Attributes:
+        iterator_config: How the input is iterated before merging. Defaults to
+            ``slice_def=()``, so the entire array is passed to the merge step.
+        output_type: Always ``"stack"``; merged labels are returned as a single
+            array.
+        squeeze: Whether to remove singleton dimensions from the output. Defaults
+            to ``False`` to preserve the input rank.
+    """
+
+    iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(
+        slice_def=()
+    )
+    output_type: Literal["stack"] = "stack"
+    squeeze: bool = False
 
 
 class Merger(StackProcessor):
+    """Base class for merging per-slice labels into a consistent volume.
+
+    Validates input dimensionality and delegates to :class:`StackProcessor` for
+    execution. Subclasses (e.g. :class:`MicroSAMMerger`) implement the actual
+    merge logic, typically via a ``merge`` method or ``_process_slice``.
+
+    By default, mergers expect a 3D label array (e.g. ``(Z, Y, X)``) where each
+    slice contains independent instance IDs that should be linked across ``Z``.
+    Arrays with fewer dimensions than required by the iterator are returned
+    unchanged; arrays with unsupported rank are logged and returned unchanged.
+
+    Used as the optional ``merger`` step in :class:`SegmentationFlow`.
+    """
 
     def __init__(self, config: MergerConfig):
-        super.__init__(config)
+        """Initialize the merger.
 
-    def _process_slice(
-        self, img_slice: np.ndarray, metadata: Optional[dict[str, Any]] = None
-    ):
-        return img_slice
+        Args:
+            config: Merger configuration.
+        """
+        super().__init__(config)
 
+    def can_merge(self, ndim: int) -> bool:
+        """Return whether this merger supports the given array rank.
+
+        Args:
+            ndim: Number of dimensions in the label array.
+
+        Returns:
+            ``True`` if the array rank matches :attr:`ndims`.
+        """
+        return ndim == self.ndims
+
+    @property
+    def ndims(self) -> int:
+        """Number of dimensions the merger expects (default: 3)."""
+        return 3
+
+    def merge(self, labels: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("Merger is not implemented")
+
+    def _process_slice(self, labels: np.ndarray, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        return self.merge(labels)
+
+    @task(name="Merger.run")
+    def run(self, labels: Union[np.ndarray, list[np.ndarray]], *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        """Merge label arrays when the input rank is supported.
+
+        Accepts a single array or a list of arrays (stacked along axis 0). If the
+        input is too low-dimensional for the configured iterator, or its rank does
+        not match :attr:`ndims`, the labels are returned without merging.
+
+        Args:
+            labels: Label array or list of label arrays to merge.
+            metadata: Optional image metadata passed through unchanged.
+            *args: Additional positional arguments for :class:`StackProcessor`.
+            **kwargs: Additional keyword arguments for :class:`StackProcessor`.
+
+        Returns:
+            Tuple of ``(merged_labels, metadata)``.
+        """
+        logger.info(f"Running Merger with config: {self.config}")
+        if isinstance(labels, list):
+            labels = np.stack(labels, axis=0)
+        slice_ndim = ArrayIterator(labels, self.config.iterator_config).slice_ndim
+        if labels.ndim < slice_ndim:
+            logger.info(f"{self.name} handles {self.ndims}-dimensional stacks or slices. The slices produced by the iterator have only {slice_ndim} dimensions. Nothing to merge")
+            return labels, metadata
+        if not self.can_merge(labels.ndim):
+            logger.error(f"Merger: cannot merge {labels.ndim}-dimensional stack")
+            return labels, metadata
+        merged,_  = super().run(labels, *args, metadata=metadata, **kwargs)
+        return merged
+
+
+class MicroSAMMergerConfig(MergerConfig):
+    """Configuration for 3D instance merging with micro_sam.
+
+    Extends :class:`MergerConfig` with parameters passed to
+    ``micro_sam.multi_dimensional_segmentation.merge_instance_segmentation_3d``.
+    Use after per-slice (2D) instance segmentation to link objects across the
+    stack axis into a single 3D label volume.
+
+    Attributes:
+        beta: Trade-off between overlap and distance when matching instances
+            across adjacent slices (higher favors overlap).
+        with_background: Whether label 0 is treated as background during merging.
+        gap_closing: Whether to close small gaps along the stack axis between
+            matched instances.
+        min_z_extent: Minimum number of slices an instance must span to be kept.
+        verbose: Whether to print progress from the underlying merge routine.
+    """
+
+    beta: float = 0.5
+    with_background: bool = True
+    gap_closing: bool = True
+    min_z_extent: int = 10
+    verbose: bool = False
+
+
+class MicroSAMMerger(Merger):
+    """Merge 2D instance label stacks into a consistent 3D label volume.
+
+    Wraps ``merge_instance_segmentation_3d`` from micro_sam. Expects a 3D array
+    of per-slice instance labels (e.g. shape ``(Z, Y, X)``) produced by a
+    segmenter such as :class:`MicroSAMSegmenter`. Instances that correspond to
+    the same object in neighboring slices receive the same label ID.
+
+    Typically used as the ``merger`` step in :class:`SegmentationFlow` after
+    slice-wise segmentation.
+    """
+
+    def __init__(self, config: MicroSAMMergerConfig):
+        """Initialize the merger.
+
+        Args:
+            config: MicroSAM merger configuration.
+        """
+        super().__init__(config)
+
+    def merge(self, labels: np.ndarray) -> np.ndarray:
+        """Link instances across slices using micro_sam.
+
+        Args:
+            labels: 3D label array with per-slice instance IDs.
+
+        Returns:
+            Label array with IDs consistent across the stack axis.
+        """
+        return merge_instance_segmentation_3d(
+            labels,
+            beta=self.config.beta,
+            with_background=self.config.with_background,
+            gap_closing=self.config.gap_closing,
+            min_z_extent=self.config.min_z_extent
+        )
 
 class RelabelerConfig(StackProcessorConfig):
     """Configuration for relabeling operations.
@@ -589,7 +913,7 @@ class LabelRemover(StackProcessor):
             )
         return result
 
-    @task(name="RegionRemover.run")
+    @task(name="LabelRemover.run")
     def run(
         self,
         labels: np.ndarray,
@@ -1011,10 +1335,17 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     """
 
     model_type: str = "vit_l_lm"
-    predictor: Optional[Any] = None
-    segmenter: Optional[Any] = None
+    #predictor: Optional[Any] = None
+    #segmenter: Optional[Any] = None
     checkpoint: Optional[str] = None
     embedding_path: Optional[str] = None
+    pred_iou_thresh: float = 0.88,
+    stability_score_thresh: float = 0.95,
+    box_nms_thresh: float = 0.7,
+    crop_nms_thresh: float = 0.7,
+    min_mask_region_area: int = 0,
+    output_mode: str = "instance_segmentation",
+    with_background: bool = True,
     device: Optional[str] = None
 
 
@@ -1048,10 +1379,8 @@ class MicroSAMSegmenter(Segmenter):
                     "passing `checkpoint` to get_predictor_and_segmenter."
                 )
 
-        if self.config.predictor is None:
-            self.config.predictor = predictor
-        if self.config.segmenter is None:
-            self.config.segmenter = segmenter
+        self.predictor = predictor
+        self.segmenter = segmenter
         # self.config.do_labels = True
         # self.config.do_regions = self.config.region_analyzer is not None
 
@@ -1062,16 +1391,16 @@ class MicroSAMSegmenter(Segmenter):
             self.config.embedding_path = (
                 os.path.expanduser()
             )  # create_unique_folder(base_path="embeddings")
-        arr_hash = hash(img_slice.tobytes())
-        embedding_path = os.path.join(self.config.embedding_path, str(arr_hash))
+        arr_hash = array_content_digest(img_slice)
+        embedding_path = os.path.join(self.config.embedding_path, arr_hash)
         os.makedirs(embedding_path, exist_ok=True)
         logger.info(
             f"Using {embedding_path} for embeddings. img_slice.shape={img_slice.shape}"
         )
 
         labels = automatic_instance_segmentation(
-            predictor=self.config.predictor,
-            segmenter=self.config.segmenter,
+            predictor=self.predictor,
+            segmenter=self.segmenter,
             input_path=img_slice,
             embedding_path=embedding_path,
         )
@@ -1110,18 +1439,23 @@ class BasicSegmenter(Segmenter):
 
 
 class SegmentationFlowConfig(WorkflowConfig):
-    """Configuration for segmentation workflow.
+    """Configuration for :class:`SegmentationFlow`.
 
-    Defines the components and options for the segmentation pipeline.
+    Composes a segmenter with optional post-segmentation steps. The segmenter
+    (e.g. :class:`MicroSAMSegmenter` or :class:`BasicSegmenter`) is responsible
+    for producing label arrays; other fields refine or filter those labels.
 
     Attributes:
-        thresholder: Optional thresholder for converting images to binary masks.
-        binary_processor: Optional processor for binary mask post-processing.
-        labeller: Optional labeller for identifying connected components.
-        region_analyzer: Optional analyzer for extracting region properties.
-        region_filter: Optional filter for removing regions based on criteria.
-        do_labels: Whether to compute and return labels.
-        do_regions: Whether to compute and return region properties.
+        segmenter: Segmenter that converts an image stack into label arrays.
+            Its ``iterator_config`` also drives relabeling after merging.
+        merger: Optional merger (e.g. :class:`MicroSAMMerger`) to link
+            per-slice instance labels into a 3D-consistent volume. Skipped when
+            ``None``.
+        region_analyzer: Optional analyzer for region properties. If omitted
+            and ``region_filter`` is set, a :class:`RegionAnalyzer` is created
+            automatically with properties required by the filter.
+        region_filter: Optional filter that removes regions by measured
+            properties; removed labels are cleared from the output mask.
     """
 
     segmenter: Segmenter = None
@@ -1138,17 +1472,36 @@ class SegmentationFlowConfig(WorkflowConfig):
 
 
 class SegmentationFlow(Workflow):
-    """Segmentation workflow that combines thresholding, labeling, and region analysis.
+    """End-to-end segmentation workflow over an image stack.
 
-    Performs a complete segmentation pipeline: thresholding -> binary processing ->
-    labeling -> region analysis -> filtering.
+    Runs the configured :class:`Segmenter`, optionally merges slice-wise labels
+    into a 3D volume, applies include/exclude masks, ensures globally unique
+    label IDs via :class:`Relabeler`, and optionally filters regions by measured
+    properties.
+
+    Pipeline (when all optional steps are enabled)::
+
+        segmenter -> merger -> mask include/exclude -> relabeler -> region filter
+
+    Example::
+
+        flow = SegmentationFlow(
+            SegmentationFlowConfig(
+                segmenter=MicroSAMSegmenter(mscfg),
+                merger=MicroSAMMerger(mmcfg),
+                region_filter=my_filter,
+            )
+        )
+        labels = flow.run(img, metadata=metadata)
     """
 
     def __init__(self, config: SegmentationFlowConfig):
-        """Initialize the segmenter.
+        """Initialize the workflow.
 
         Args:
-            config: Segmenter configuration.
+            config: Segmentation flow configuration. When ``region_filter`` is set
+                but ``region_analyzer`` is not, a default analyzer is created
+                with properties needed by the filter.
         """
         super().__init__(config)
         if (
@@ -1199,11 +1552,11 @@ class SegmentationFlow(Workflow):
             np.ndarray: Labeled regions.
         """
         # process the image
-        raw_labels, _ = self.config.segmenter.run(img, metadata=metadata)
+        raw_labels, _ = self.config.segmenter.run(img, *args, metadata=metadata, **kwargs)
 
         # merge labels
         if self.config.merger is not None:
-            labels = self.config.merger.run(raw_labels)
+            labels = self.config.merger.run(raw_labels,*args, metadata=metadata, **kwargs)
         else:
             labels = raw_labels
 
@@ -1218,11 +1571,11 @@ class SegmentationFlow(Workflow):
         # update the labels to ensure they are unique across the substacks
         iterator_config = self.config.segmenter.config.iterator_config
         relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
-        labels = relabeler.run(labels, metadata=metadata)
+        labels = relabeler.run(labels,*args, metadata=metadata, **kwargs)
 
         # filter labels based on region properties
         if self.config.region_filter is not None:
-            regions = self.config.region_analyzer.run(labels, metadata=metadata)
+            regions = self.config.region_analyzer.run(labels,*args, metadata=metadata, **kwargs)
             # Flatten regions if it's a list of lists (from iterator processing)
             if isinstance(regions, list) and len(regions) > 0:
                 # Check if first element is a list (nested structure from iterator)
@@ -1245,9 +1598,11 @@ class SegmentationFlow(Workflow):
 
 class TiledSegmentationFlowConfig(SegmentationFlowConfig):
 
-    tile_factor: Tuple[int, ...] = (2, 2)
-    resize_factor: Tuple[float, ...] = None
-    padding: Union[int, Tuple[Tuple[int, int]]] = 5
+    tile_factor: Tuple[int, ...] = (3, 3)
+    resize_factor: Tuple[float, ...] = (0.25, 0.25)
+    pad_width: Union[int, Tuple[Tuple[int, int]], dict[int, Tuple[int, int]]] = {-2:(0,5), -1:(0,5)}
+    iou_threshold: float = 0.5
+    consensus_threshold: float = 0.5
 
 
 class TiledSegmentationFlow(SegmentationFlow):
@@ -1255,27 +1610,80 @@ class TiledSegmentationFlow(SegmentationFlow):
     def __init__(self, config: TiledSegmentationFlowConfig):
         super().__init__(config)
 
+
+    @flow(name="TiledSegmentationFlow.run")
     def run(
         self,
         stack: np.ndarray,
         *args,
         metadata: Optional[dict[str, Any]] = None,
+        config: Optional[TiledSegmentationFlowConfig] = TiledSegmentationFlowConfig(),
         **kwargs,
     ):
+        """Run the tiled segmentation flow.
+
+        Args:
+            stack: The input stack.
+            *args: Additional arguments.
+            metadata: The metadata.
+            **kwargs: Additional keyword arguments.
+        """
+        # get original width and height
+        orig_width = stack.shape[-1]
+        orig_height = stack.shape[-2]
 
         # resize
+        width = stack.shape[-1]*self.config.resize_factor[-1]
+        height = stack.shape[-2]*self.config.resize_factor[-2]
+        rcfg = ResizeConfig(width=width, height=height)
+        r_stack, r_metadata = Resize(rcfg).run(stack, metadata=metadata, **kwargs)
 
-        # pad
+        # tile with padding
+        tcfg = TilerConfig(factor=self.config.tile_factor, alt_flip=False, pad_width=self.config.pad_width)
+        t_stack,t_metadata = Tiler(tcfg).run(r_stack, *args,metadata=r_metadata, **kwargs)
 
-        # tile
+        # run segmentation on tiled stack
+        t_labels = super().run(t_stack, *args,metadata=t_metadata, **kwargs)
 
-        results = super().run(stack, *args, metadata=metadata, **kwargs)
+        # analyze regions
+        ra = RegionAnalyzer(
+            RegionAnalyzerConfig(
+                output_type="dataframe", 
+                properties=["bbox"],
+                iterator_config=ArrayIteratorConfig(slice_def=())
+            )
+        )
+        t_results = ra.run(t_labels, *args, metadata=t_metadata, **kwargs)
+
+        # group regions
+        divisor = t_labels.shape[-1]//self.config.tile_factor[-1]
+        logger.info(f"Divisor: {divisor}, t_labels.shape: {t_labels.shape}, self.config.tile_factor: {self.config.tile_factor}")
+        if stack.ndim == 3:
+            t_groups = group_bboxes(t_results[["bbox-2", "bbox-1", "bbox-0", "bbox-5", "bbox-4", "bbox-3"]].to_numpy()-np.array((0,0,0,1,1,1)), divisor=divisor, threshold=self.config.iou_threshold)
+        elif stack.ndim == 2:
+            t_groups = group_bboxes(t_results[["bbox-1", "bbox-0", "bbox-3", "bbox-2"]].to_numpy()-np.array((0,0,1,1)), divisor=divisor, threshold=self.config.iou_threshold)
+        else:
+            raise ValueError(f"Unsupported number of dimensions: {stack.ndim}")
+
+        # convert labels to masks
+        t_masks = labels_to_masks(t_labels)
 
         # untile
+        ucfg = UntilerConfig(
+            factor = self.config.tile_factor,
+            iterator_config = ArrayIteratorConfig(slice_def=())
+        )
+        untiled,_ = Untiler(ucfg).run(t_masks)
+        t_proj =  np.sum(untiled>0, axis=0)>0
 
-        # unpad
+        # label grouped mask
+        labels = label_grouped_mask(t_proj, t_groups, threshold=self.config.consensus_threshold)
 
-        # majority vote
+        # remove padding
+        cropped_height = labels.shape[-2]-self.config.pad_width[-2][1]
+        cropped_width = labels.shape[-1]-self.config.pad_width[-1][1]
+        cropped_labels = labels[..., 0:cropped_height, 0:cropped_width]
 
-        # resize
-        return results
+        ecfg = ResizeConfig(width=orig_width, height=orig_height, normalize=False, dtype=np.uint16)
+        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
+        return resized_labels

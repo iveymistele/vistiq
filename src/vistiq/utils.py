@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import logging
 import fnmatch
@@ -169,7 +170,8 @@ class ArrayIterator:
     Examples:
         For array shape (5, 30, 20):
         - slice_def = (-2, -1): Keep last 2 axes, iterate over axis 0
-        - slice_def = (0, 1): Keep first 2 axes, iterate over axis 2
+        - slice_def = (0, 1): Keep first 2 axes, iterate over axis 2 through n-1 (n is the number of axes)
+        - slice_def = (): Keep all axes, single iteration returns the entire array
     """
 
     def __init__(self, arr: np.ndarray, config: ArrayIteratorConfig):
@@ -185,6 +187,7 @@ class ArrayIterator:
         self.shape = arr.shape
         self.config = config
         self.ndim = len(arr.shape)
+        self.slice_ndim = len(config.slice_def) if config.slice_def is not None else self.ndim
 
         # Special case: empty slice_def means process entire array as single slice
         if len(config.slice_def) == 0:
@@ -266,6 +269,27 @@ def create_unique_folder(base_path=".", prefix="", suffix="", exist_ok=True):
     os.makedirs(full_path, exist_ok=exist_ok)
     return full_path
 
+
+def array_content_digest(arr: np.ndarray) -> str:
+    """Return a stable hex digest of array values, shape, and dtype.
+
+    Uses SHA-256 over C-contiguous raw bytes. Unlike built-in ``hash()``, this is
+    deterministic across processes and Python runs (``hash()`` is salted via
+    ``PYTHONHASHSEED``).
+
+    Args:
+        arr: Input array. Fortran-ordered views are normalized to C order before
+            hashing so logically identical data produces the same digest.
+
+    Returns:
+        Lowercase hex SHA-256 digest string.
+    """
+    arr_c = np.ascontiguousarray(arr)
+    hasher = hashlib.sha256()
+    hasher.update(str(arr_c.dtype).encode())
+    hasher.update(",".join(map(str, arr_c.shape)).encode())
+    hasher.update(arr_c.tobytes())
+    return hasher.hexdigest()
 
 
 def masks_to_labels(masks: list[np.ndarray]) -> np.ndarray:

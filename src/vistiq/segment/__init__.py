@@ -30,6 +30,8 @@ from vistiq.segment.select import (
 from vistiq.segment.label import (
     SegmentationFlow,
     SegmentationFlowConfig,
+    TiledSegmentationFlow,
+    TiledSegmentationFlowConfig,
     IterativeSegmenter,
     IterativeSegmenterConfig,
     LabelRemover,
@@ -38,6 +40,8 @@ from vistiq.segment.label import (
     LabellerConfig,
     MicroSAMSegmenter,
     MicroSAMSegmenterConfig,
+    MicroSAMMerger,
+    MicroSAMMergerConfig,
     Relabeler,
     RelabelerConfig,
     remap_dataframe_labels,

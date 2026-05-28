@@ -965,17 +965,16 @@ class ImageWriter(DataWriter):
         else:
             path = path.expanduser()
 
-        if os.path.exists(path) and not self.config.overwrite:
-            raise FileExistsError(f"File already exists: {path}")
-
         if metadata is None:
             metadata = {}
 
+        logger.info(f"ImageWriter: using config: {self.config}")
         logger.info(f"Preparing to save image with metadata: {metadata}")
         from collections import namedtuple
 
         PhysicalPixelSizes = namedtuple("PhysicalPixelSizes", ["Z", "Y", "X"])
-        if self.config.split_channels:
+        outpaths = []
+        if self.config.split_channels and "C" in metadata.get("axes", []):
             data, metadata = unstack_image(data, metadata, "C", key="axes")
             for img, m in zip(data, metadata):
                 channel_names = m.get("channel_names", [])
@@ -983,35 +982,43 @@ class ImageWriter(DataWriter):
                 physical_pixel_sizes = (
                     PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
                 )
+                outpath = path.with_suffix(
+                    f".{'-'.join(channel_names)}.{self.config.extension}"
+                )
+                if os.path.exists(outpath) and not self.config.overwrite:
+                    raise FileExistsError(f"File already exists: {outpath}")
 
                 OmeTiffWriter.save(
                     data=img,
-                    uri=path.with_suffix(
-                        f".{'-'.join(channel_names)}.{self.config.extension}"
-                    ),
+                    uri=outpath,
                     dim_order=m.get("dim_order", ""),
                     channel_names=m.get("channel_names", None),
                     image_name=m.get("image_names", None),
                     physical_pixel_sizes=physical_pixel_sizes,
                 )
+                outpaths.append(outpath)
         else:
             channel_names = metadata.get("channel_names", [])
             pps = metadata.get("physical_pixel_sizes", None)
             physical_pixel_sizes = (
                 PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
             )
+            outpath = path.with_suffix(
+                f".{'-'.join(channel_names)}.{self.config.extension}"
+            )
+            if os.path.exists(outpath) and not self.config.overwrite:
+                raise FileExistsError(f"File already exists: {outpath}")
 
             OmeTiffWriter.save(
                 data=data,
-                uri=path.with_suffix(
-                    f".{'-'.join(channel_names)}.{self.config.extension}"
-                ),
+                uri=outpath,
                 dim_order=metadata.get("dim_order", ""),
                 channel_names=metadata.get("channel_names", []),
                 image_name=metadata.get("image_names", ""),
                 physical_pixel_sizes=physical_pixel_sizes,
             )
-        logger.info(f"Saved image to {path}")
+            outpaths.append(outpath)
+        logger.info(f"Saved image to {outpaths}")
 
 
 class DataLoaderConfig(Configuration):
@@ -1105,6 +1112,10 @@ class ImageLoaderConfig(DataLoaderConfig):
     rename_channel: Optional[dict[str, str]] = Field(
         default=None,
         description="Dictionary mapping original channel names to new names (format: 'old1:new1;old2:new2')",
+    )
+    reader: Optional[type] = Field(
+        default=None,
+        description="Reader class to use. If None, bioio will auto-detect the appropriate reader.",
     )
 
     @field_validator("rename_channel", mode="before")
@@ -1342,6 +1353,7 @@ class ImageLoader(DataLoader):
             substack=substack_slices,
             squeeze=self.config.squeeze,
             rename_channel=self.config.rename_channel,
+            reader=self.config.reader,
         )
 
         # Apply grayscale conversion if requested
