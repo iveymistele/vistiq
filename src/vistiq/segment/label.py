@@ -27,6 +27,8 @@ from vistiq.segment.postprocess import (
     dilate_regions,
 )
 from vistiq.segment.select import (
+    RangeFilter,
+    RangeFilterConfig,
     RegionFilter,
     RegionFilterConfig,
 )
