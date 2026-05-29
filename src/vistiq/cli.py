@@ -33,6 +33,7 @@ from .io import (
     ImageWriterConfig,
 )
 from .preprocess import PreprocessorConfig
+from .segment import LabellerConfig, SegmenterConfig, ThresholderConfig
 from .train import (
     TrainerConfig,
     DatasetCreatorConfig,
@@ -65,6 +66,13 @@ import pandas as pd
 # from .app import configure_logger
 
 logger = logging.getLogger(__name__)
+
+SegmentStepConfig = Union[
+    PreprocessorConfig,
+    ThresholderConfig,
+    SegmenterConfig,
+    LabellerConfig,
+]
 
 
 def _register_workflow_segmenters() -> None:
@@ -308,7 +316,7 @@ class CLISegmenterConfig(CLISubcommandConfig):
         default_factory=ImageLoaderConfig,
         description="Configuration for input data loading",
     )
-    step: Optional[list[StackProcessorConfig]] = Field(
+    step: Optional[list[SegmentStepConfig]] = Field(
         default=None,
         description="Configs for chain of thresholding/segmenting/labelling components to run",
     )
@@ -324,8 +332,8 @@ class CLISegmenterConfig(CLISubcommandConfig):
     @field_validator("step")
     @classmethod
     def validate_step(
-        cls, v: Optional[List[StackProcessorConfig]]
-    ) -> Optional[List[StackProcessorConfig]]:
+        cls, v: Optional[List[SegmentStepConfig]]
+    ) -> Optional[List[SegmentStepConfig]]:
         """Validate that steps are valid.
 
         Args:
@@ -1068,7 +1076,7 @@ def segment_cmd(
         help="Configuration to specify the data loader to use",
         parser=cli_to_imageloader_config,
     ),
-    step: List[StackProcessorConfig] = Option(
+    step: List[SegmentStepConfig] = Option(
         None,
         "--step",
         "-s",
@@ -1199,7 +1207,7 @@ def pipeline_cmd(
         help="Image loader configuration",
         parser=cli_to_imageloader_config,
     ),
-    step: List[StackProcessorConfig] = Option(
+    step: List[SegmentStepConfig] = Option(
         None,
         "--step",
         "-s",
