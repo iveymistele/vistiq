@@ -1252,8 +1252,7 @@ class MicroSAMSegmenter(Segmenter):
         Returns:
             Regions: List of regions.
         """
-        if self.config.embedding_path is None:
-            self.config.embedding_path = create_unique_folder(base_path="embeddings")
+        self.config.embedding_path = create_unique_folder(base_path="embeddings")
         labels = automatic_instance_segmentation(
             predictor=self.config.predictor,
             segmenter=self.config.segmenter,
