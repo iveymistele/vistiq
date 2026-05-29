@@ -1076,7 +1076,7 @@ def segment_cmd(
         help="Configuration to specify the data loader to use",
         parser=cli_to_imageloader_config,
     ),
-    step: List[SegmentStepConfig] = Option(
+    step: Optional[List[str]] = Option(
         None,
         "--step",
         "-s",
@@ -1207,7 +1207,7 @@ def pipeline_cmd(
         help="Image loader configuration",
         parser=cli_to_imageloader_config,
     ),
-    step: List[SegmentStepConfig] = Option(
+    step: Optional[List[str]] = Option(
         None,
         "--step",
         "-s",
