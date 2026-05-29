@@ -1,5 +1,21 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, Literal, Any, Optional, Tuple, Union, TYPE_CHECKING
+from typing import (
+    Generic,
+    TypeVar,
+    Literal,
+    Any,
+    Optional,
+    Tuple,
+    Union,
+    TYPE_CHECKING,
+    ClassVar,
+    Type,
+    Sequence,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+import inspect
 from pydantic import BaseModel, PositiveInt, Field, field_validator, ImportString
 
 # from pydantic.dataclasses import dataclass
@@ -225,6 +241,168 @@ class Configurable(ABC, Generic[ConfigType]):
     Type Parameters:
         ConfigType: The type of configuration model this object uses.
     """
+
+    _registry: ClassVar[dict[type["Configuration"], type["Configurable"]]] = {}
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        config_type = cls._infer_config_type()
+        if config_type is None:
+            config_type = cls._infer_config_type_from_init()
+        if config_type is None:
+            config_type = cls._infer_config_type_from_from_config()
+        if config_type is not None:
+            Configurable._registry[config_type] = cls
+
+    @classmethod
+    def _infer_config_type(cls) -> Optional[type["Configuration"]]:
+        for base in getattr(cls, "__orig_bases__", []):
+            if get_origin(base) is Configurable:
+                args = get_args(base)
+                if len(args) == 1 and isinstance(args[0], type):
+                    candidate = args[0]
+                    if issubclass(candidate, Configuration):
+                        return candidate
+        return None
+
+    @classmethod
+    def _infer_config_type_from_init(cls) -> Optional[type["Configuration"]]:
+        """Infer config type from ``__init__(self, config: ...)`` annotation."""
+        init = getattr(cls, "__init__", None)
+        if init is None:
+            return None
+        try:
+            module = inspect.getmodule(cls)
+            globalns = module.__dict__ if module is not None else None
+            hints = get_type_hints(init, globalns=globalns, localns=vars(cls))
+            config_hint = hints.get("config")
+            if (
+                isinstance(config_hint, type)
+                and issubclass(config_hint, Configuration)
+                and config_hint is not Configuration
+            ):
+                return config_hint
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _infer_config_type_from_from_config(cls) -> Optional[type["Configuration"]]:
+        """Infer config type from ``from_config`` only when declared on ``cls`` itself."""
+        if "from_config" not in cls.__dict__:
+            return None
+        from_config = cls.from_config
+        try:
+            module = inspect.getmodule(cls)
+            globalns = module.__dict__ if module is not None else None
+            hints = get_type_hints(from_config, globalns=globalns, localns=vars(cls))
+            config_hint = hints.get("config")
+            if (
+                isinstance(config_hint, type)
+                and issubclass(config_hint, Configuration)
+                and config_hint is not Configuration
+            ):
+                return config_hint
+        except Exception:
+            # Best-effort inference: skip if annotations can't be resolved.
+            return None
+        return None
+
+    @classmethod
+    def registry(cls) -> dict[type["Configuration"], type["Configurable"]]:
+        """Return a copy of config-to-configurable registry."""
+        return dict(Configurable._registry)
+
+    @classmethod
+    def get_class_for_config(
+        cls, config: "Configuration | type[Configuration]"
+    ) -> Optional[type["Configurable"]]:
+        """Resolve configurable class for a config instance or type (exact match only)."""
+        config_type = config if isinstance(config, type) else type(config)
+        return Configurable._registry.get(config_type)
+
+    @classmethod
+    def create_from_config(cls, config: "Configuration") -> "Configurable":
+        """Instantiate the registered configurable for a configuration."""
+        instance, error = cls.try_create_from_config(config)
+        if error is not None:
+            raise RuntimeError(error)
+        return instance
+
+    @staticmethod
+    def _instance_matches_expected_type(instance: Any, expected_type: type) -> bool:
+        """Check instance against ``expected_type``, including generic aliases."""
+        origin = get_origin(expected_type)
+        if origin is not None:
+            return isinstance(instance, origin)
+        return isinstance(instance, expected_type)
+
+    @staticmethod
+    def _expected_type_label(expected_type: type) -> str:
+        origin = get_origin(expected_type)
+        if origin is not None:
+            return origin.__name__
+        return getattr(expected_type, "__name__", repr(expected_type))
+
+    @classmethod
+    def try_create_from_config(
+        cls,
+        config: "Configuration",
+        *,
+        expected_type: type | None = None,
+    ) -> tuple[Optional["Configurable"], Optional[str]]:
+        """Try to instantiate a configurable; return ``(instance, None)`` or ``(None, error)``."""
+        config_name = type(config).__name__
+        configurable_cls = cls.get_class_for_config(config)
+        if configurable_cls is None:
+            supported = [cfg.__name__ for cfg in cls.registry().keys()]
+            return None, (
+                f"unknown config type '{config_name}'. "
+                f"Supported config types: {supported}."
+            )
+        try:
+            instance = configurable_cls.from_config(config)
+        except Exception as exc:
+            return None, (
+                f"failed to instantiate '{configurable_cls.__name__}' "
+                f"from config '{config_name}': {exc}"
+            )
+        if expected_type is not None and not cls._instance_matches_expected_type(
+            instance, expected_type
+        ):
+            return None, (
+                f"config '{config_name}' resolved to '{configurable_cls.__name__}', "
+                f"which is not a {cls._expected_type_label(expected_type)}."
+            )
+        return instance, None
+
+    @classmethod
+    def create_many_from_configs(
+        cls,
+        configs: Sequence["Configuration"],
+        *,
+        expected_type: type | None = None,
+        index_errors: bool = True,
+        error_header: str = "Failed to instantiate configurables",
+    ) -> list["Configurable"]:
+        """Instantiate configurables for each config, raising once with all failures."""
+        instances: list[Configurable] = []
+        failures: list[str] = []
+
+        for index, config in enumerate(configs):
+            instance, error = cls.try_create_from_config(
+                config, expected_type=expected_type
+            )
+            if error is None:
+                instances.append(instance)
+            else:
+                failures.append(f"index {index}: {error}" if index_errors else error)
+
+        if failures:
+            raise RuntimeError(
+                f"{error_header}:\n" + "\n".join(f"  - {msg}" for msg in failures)
+            )
+        return instances
 
     def __init__(self, config: ConfigType):
         """Initialize the configurable object.
@@ -814,6 +992,21 @@ class ChainProcessor(Configurable[ChainProcessorConfig]):
 
 
 class TilerConfig(StackProcessorConfig):
+    """Configuration for array tiling.
+
+    Repeats each input slice according to ``factor``. Optional padding can be
+    applied before tiling to avoid edge truncation in downstream workflows.
+
+    Attributes:
+        factor: Repeat factor per axis passed to ``np.tile``.
+        pad_width: Optional padding spec forwarded to ``np.pad``. Supports:
+            an ``int``, tuple-of-tuples, or dict keyed by axis index
+            (including negative indices).
+        pad_kwargs: Extra keyword arguments for ``np.pad``.
+        alt_flip: If ``True``, tiles by mirroring/flipping content before
+            cropping; otherwise uses direct ``np.tile``.
+        iterator_config: Iterator behavior inherited from ``StackProcessor``.
+    """
 
     factor: Tuple[int, ...]
     pad_width: Union[
@@ -825,6 +1018,7 @@ class TilerConfig(StackProcessorConfig):
 
 
 class Tiler(StackProcessor):
+    """Tile arrays by repeating image content along configured axes."""
 
     def __init__(self, config: TilerConfig):
         super().__init__(config)
@@ -852,6 +1046,7 @@ class Tiler(StackProcessor):
         return tiled
 
     def _resolve_pad_width(self, ndim: int):
+        """Normalize dict-based ``pad_width`` to NumPy's per-axis tuple format."""
         pad_width = self.config.pad_width
         if pad_width is None:
             return None
@@ -882,6 +1077,17 @@ class Tiler(StackProcessor):
         return pad_width
 
     def run(self, stack, *args, metadata: Optional[dict[str, Any]] = None, **kwargs):
+        """Pad (optionally) and tile the input stack.
+
+        Args:
+            stack: Input array.
+            metadata: Optional metadata propagated through processing.
+            *args: Additional positional arguments.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Tuple of tiled stack and updated metadata.
+        """
         if self.config.pad_width is not None:
             pad_width = self._resolve_pad_width(stack.ndim)
             stack = np.pad(
@@ -923,7 +1129,7 @@ class FuncProcessorConfig(StackProcessorConfig):
     iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(slice_def=())
     strict_axis: bool = True
     dtype: Literal[
-        np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool
+        np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64, bool, int
     ] = None
     func: ImportString = None
     args: list[Any] = []

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from typing import Optional, Literal, Any
+from typing import Optional, Literal, Any, Union
 from pydantic import Field, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
 from skimage.exposure import rescale_intensity
@@ -19,7 +19,7 @@ from vistiq.core import (
     StackProcessor,
     cli_config,
 )
-from prefect import task
+from prefect import task, flow
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,15 @@ logger = logging.getLogger(__name__)
 class PreprocessorConfig(StackProcessorConfig):
     """Configuration for image preprocessing operations.
 
-    This configuration class defines parameters for preprocessing steps, e.g. normalization, denoising and Difference of Gaussians (DoG)
-    filtering.
+    Shared options used by preprocessing operators derived from
+    :class:`Preprocessor`.
+
+    Attributes:
+        normalize: If ``True``, normalize the processed output to ``[0, 1]``
+            before dtype scaling.
+        output_type: Output container format. Preprocessors return ``"stack"``.
+        dtype: Target dtype of processed output. If ``None``, the input dtype is
+            preserved.
     """
 
     normalize: bool = Field(
@@ -56,10 +63,10 @@ class PreprocessorConfig(StackProcessorConfig):
 
 
 class Preprocessor(StackProcessor):
-    """Preprocessor for image stacks using denoising and Difference of Gaussians filtering.
+    """Base class for stack preprocessing operations.
 
-    This class provides configurable preprocessing operations including temporal denoising
-    and Difference of Gaussians (DoG) filtering for image stacks.
+    Runs per-slice processing via :class:`StackProcessor`, then applies optional
+    normalization and dtype conversion/scaling in a consistent way.
     """
 
     def __init__(self, config: PreprocessorConfig):
@@ -110,11 +117,14 @@ class Preprocessor(StackProcessor):
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Run the preprocess chain on an image stack.
+        """Run preprocessing on an image stack.
 
         Args:
             stack: Input image stack.
+            workers: Number of workers for per-slice processing.
+            verbose: Verbosity level for parallel processing.
             metadata: Optional metadata to pass to the processor.
+            *args: Additional positional args for slice processing.
             **kwargs: Additional keyword arguments to pass to the processor.
 
         Returns:
@@ -178,61 +188,105 @@ class Preprocessor(StackProcessor):
         return (preprocessed, updated_metadata)
 
 
-class PreprocessChainConfig(Configuration):
-    """Configuration for chain of preprocessors.
+class ProcessChainConfig(Configuration):
+    """Configuration for sequential preprocessing pipelines.
 
-    This configuration class defines parameters for chaining multiple preprocessors.
+    Attributes:
+        processors: Ordered list of any registered :class:`~vistiq.core.Configuration`
+            subclasses (e.g. :class:`RescaleConfig`, :class:`DoGConfig`). Each is
+            resolved to its matching :class:`~vistiq.core.Configurable` via the
+            app registry at chain construction time.
     """
 
-    preprocessors: list[PreprocessorConfig] = Field(
-        default=[], description="List of preprocessors to apply"
+    processors: list[Configuration] = Field(
+        default=[], description="List of Configuration objects to apply in sequence"
     )
 
 
-class PreprocessChain(Configurable):
-    """Chain of preprocessors for image processing.
+class ProcessChain(Configurable):
+    """Apply multiple configurables sequentially to the same stack.
 
-    This class chains multiple preprocessors together, applying each one in sequence to the input stack.
+    Each entry in ``config.processors`` may be any :class:`Configuration`
+    subclass registered with :class:`Configurable` (not limited to
+    :class:`PreprocessorConfig`).
     """
 
-    def __init__(self, config: PreprocessChainConfig):
+    def __init__(self, config: ProcessChainConfig):
         """Initialize the preprocess chain.
 
         Args:
-            config: Preprocess chain configuration.
+            config: Process chain configuration.
         """
         super().__init__(config)
+        self.processors: list[Configurable] = Configurable.create_many_from_configs(
+            self.config.processors,
+            expected_type=Configurable[Configuration],
+            error_header="Failed to instantiate ProcessChain processors",
+        )
+        logger.info(f"Setting up ProcessChain with {",".join([p.__class__.__name__ for p in self.processors])}")
 
     @classmethod
-    def from_config(cls, config: PreprocessChainConfig) -> "PreprocessChain":
-        """Create a PreprocessChain instance from a configuration.
+    def from_config(cls, config: ProcessChainConfig) -> "ProcessChain":
+        """Create a ProcessChain instance from a configuration.
 
         Args:
-            config: Preprocess chain configuration.
+            config: Process chain configuration.
         """
         return cls(config)
 
-    @task(name="PreprocessChain.run")
+    @flow(name="ProcessChain.run")
     def run(
         self,
         stack: np.ndarray,
         *args,
-        workers: int = 1,
+        workers: Union[int, list[int]] = -1,
         verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Run the preprocess chain on an image stack.
+        """Run configured processing steps in sequence.
 
         Args:
             stack: Input image stack.
-            metadata: Optional metadata to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
+            workers: Number of workers used by each processor.
+            verbose: Verbosity level forwarded to each processor.
+            metadata: Optional metadata supplied to processors.
+            *args: Additional positional args forwarded to processors.
+            **kwargs: Additional keyword arguments forwarded to processors.
 
         Returns:
             Tuple of (processed image stack, updated metadata or None).
         """
-        return super().run(stack, *args, workers=workers, verbose=verbose)
+        current_stack = stack
+        current_metadata = metadata
+        if isinstance(workers, int):
+            workers = [workers] * len(self.processors)
+        if len(workers) != len(self.processors):
+            logger.warning(f"Number of workers ({len(workers)}) must match number of processors ({len(self.processors)}). Updating worker specification to match number of processors.")
+            if len(workers) < len(self.processors):
+                workers = workers + [-1] * (len(self.processors) - len(workers))
+            else:
+                workers = workers[:len(self.processors)]
+
+        logger.info(f"Running ProcessChain with {len(self.processors)} processors")
+        for processor, processor_workers in zip(self.processors, workers):
+            result = processor.run(
+                current_stack,
+                *args,
+                workers=processor_workers,
+                verbose=verbose,
+                metadata=current_metadata,
+                **kwargs,
+            )
+
+            # Support both APIs: processor.run() may return stack only,
+            # or (stack, metadata).
+            if isinstance(result, tuple) and len(result) == 2:
+                current_stack, current_metadata = result
+            else:
+                current_stack = result
+
+        return current_stack, current_metadata
 
 
 class DoG(Preprocessor):

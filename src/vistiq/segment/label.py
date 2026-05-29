@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import supervision as sv
 
+from os import PathLike
 from micro_sam.automatic_segmentation import (
     automatic_instance_segmentation,
     get_predictor_and_segmenter,
@@ -961,7 +962,7 @@ class LabelRemover(StackProcessor):
             return results, mapping
         else:
             logger.debug(f"Results after removal: {results}")
-            return results
+            return results, None
 
 
 class LabellerConfig(StackProcessorConfig):
@@ -1335,18 +1336,20 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     """
 
     model_type: str = "vit_l_lm"
+    # segmmentation_mode: Literal["ais", "amg", "apg"] = "ais" # need to upgrade micro_sam to support this
     #predictor: Optional[Any] = None
     #segmenter: Optional[Any] = None
     checkpoint: Optional[str] = None
     embedding_path: Optional[str] = None
-    pred_iou_thresh: float = 0.88,
-    stability_score_thresh: float = 0.95,
-    box_nms_thresh: float = 0.7,
-    crop_nms_thresh: float = 0.7,
-    min_mask_region_area: int = 0,
-    output_mode: str = "instance_segmentation",
-    with_background: bool = True,
+    pred_iou_thresh: float = 0.88
+    stability_score_thresh: float = 0.95
+    box_nms_thresh: float = 0.7
+    crop_nms_thresh: float = 0.7
+    min_mask_region_area: int = 0
+    output_mode: str = "instance_segmentation"
+    with_background: bool = True
     device: Optional[str] = None
+    # ndim: Optional[int] = None # image specific, should be set at runtime if needed
 
 
 class MicroSAMSegmenter(Segmenter):
@@ -1363,15 +1366,18 @@ class MicroSAMSegmenter(Segmenter):
                 predictor, segmenter = get_predictor_and_segmenter(
                     model_type=self.config.model_type,
                     checkpoint=self.config.checkpoint,
+                    # segmentation_mode=self.config.segmmentation_mode,
                 )
             else:
                 predictor, segmenter = get_predictor_and_segmenter(
-                    model_type=self.config.model_type
+                    model_type=self.config.model_type,
+                    # segmentation_mode=self.config.segmmentation_mode,
                 )
         except TypeError:
             # Older micro_sam versions may not accept `checkpoint=...`
             predictor, segmenter = get_predictor_and_segmenter(
-                model_type=self.config.model_type
+                model_type=self.config.model_type,
+                # segmentation_mode=self.config.segmmentation_mode,
             )
             if self.config.checkpoint:
                 raise ValueError(
@@ -1385,7 +1391,7 @@ class MicroSAMSegmenter(Segmenter):
         # self.config.do_regions = self.config.region_analyzer is not None
 
     def _process_slice(
-        self, img_slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+        self, img_slice: np.ndarray, mask_path:Optional[Union[Union[PathLike, str], np.ndarray]] = None,metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
         if self.config.embedding_path is None:
             self.config.embedding_path = (
@@ -1403,19 +1409,30 @@ class MicroSAMSegmenter(Segmenter):
             segmenter=self.segmenter,
             input_path=img_slice,
             embedding_path=embedding_path,
+            # ndim=self.config.ndim,
+            # pred_iou_thresh=self.config.pred_iou_thresh,
+            # stability_score_thresh=self.config.stability_score_thresh,
+            # box_nms_thresh=self.config.box_nms_thresh,
+            # crop_nms_thresh=self.config.crop_nms_thresh,
+            # min_mask_region_area=self.config.min_mask_region_area,
+            # output_mode=self.config.output_mode,
+            # with_background=self.config.with_background,
+            # mask_path=mask_path,
+            # device=self.config.device,
         )
         return labels
 
 
 class BasicSegmenterConfig(SegmenterConfig):
-    """Configuration for segmentation workflow.
+    """Configuration for a threshold-based segmentation pipeline.
 
-    Defines basic components to convert image into binary mask and label each object.
+    Defines a simple three-stage pipeline:
+    threshold -> optional binary post-processing -> connected-component labeling.
 
     Attributes:
-        thresholder: Optional thresholder for converting images to binary masks.
-        binary_processor: Optional processor for postprocessing of binary mask before labeling.
-        labeller: Optional labeller for identifying connected components.
+        thresholder: Converts image intensities into a binary foreground mask.
+        binary_processor: Optional morphological cleanup on the binary mask.
+        labeller: Connected-component labeler applied to the final mask.
     """
 
     thresholder: Optional[Thresholder] = OtsuThreshold(OtsuThresholdConfig())
@@ -1521,7 +1538,7 @@ class SegmentationFlow(Workflow):
             logger.info(
                 f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {properties}"
             )
-            self.config.region_analyzer = RegionAnalyzer(
+            self.region_analyzer = RegionAnalyzer(
                 RegionAnalyzerConfig(
                     iterator_config=self.config.segmenter.config.iterator_config,
                     output_type="list",
@@ -1530,7 +1547,7 @@ class SegmentationFlow(Workflow):
             )
         logger.info(f"Segmenter config: {self.config}")
 
-    @flow(name="Segmenter.run")
+    @task(name="Segmenter.run")
     def run(
         self,
         img: np.ndarray,
@@ -1540,16 +1557,20 @@ class SegmentationFlow(Workflow):
         exclude_masks: Optional[list[np.ndarray]] = None,
         **kwargs,
     ) -> Union[np.ndarray, list[np.ndarray]]:
-        """Run the segment step.
+        """Run the segmentation flow on an input image/stack.
 
         Args:
-            img (np.ndarray): Input image.
-            include_masks (Optional[list[np.ndarray]]): Optional binary mask to include in the segmentation.
-            exclude_masks (Optional[list[np.ndarray]]): Optional binary mask to exclude from the segmentation.
-            metadata (Optional[dict[str, Any]]): Optional metadata describing the input image.
+            img: Input image or stack.
+            metadata: Optional metadata describing the input.
+            include_masks: Optional masks multiplied into labels to keep only
+                selected regions.
+            exclude_masks: Optional masks multiplied out of labels to remove
+                selected regions.
+            *args: Additional positional arguments forwarded to processors.
+            **kwargs: Additional keyword arguments forwarded to processors.
 
         Returns:
-            np.ndarray: Labeled regions.
+            Segmentation label array.
         """
         # process the image
         raw_labels, _ = self.config.segmenter.run(img, *args, metadata=metadata, **kwargs)
@@ -1569,13 +1590,16 @@ class SegmentationFlow(Workflow):
                 labels = labels * ~mask
 
         # update the labels to ensure they are unique across the substacks
+        l_before = np.unique(labels)
         iterator_config = self.config.segmenter.config.iterator_config
         relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
         labels = relabeler.run(labels,*args, metadata=metadata, **kwargs)
+        l_after = np.unique(labels)
+        logger.debug(f"Relabeler: l_before == l_after:{l_before == l_after}")
 
         # filter labels based on region properties
         if self.config.region_filter is not None:
-            regions = self.config.region_analyzer.run(labels,*args, metadata=metadata, **kwargs)
+            regions = self.region_analyzer.run(labels,*args, metadata=metadata, **kwargs)
             # Flatten regions if it's a list of lists (from iterator processing)
             if isinstance(regions, list) and len(regions) > 0:
                 # Check if first element is a list (nested structure from iterator)
@@ -1611,7 +1635,7 @@ class TiledSegmentationFlow(SegmentationFlow):
         super().__init__(config)
 
 
-    @flow(name="TiledSegmentationFlow.run")
+    @task(name="TiledSegmentationFlow.run")
     def run(
         self,
         stack: np.ndarray,
@@ -1646,14 +1670,14 @@ class TiledSegmentationFlow(SegmentationFlow):
         t_labels = super().run(t_stack, *args,metadata=t_metadata, **kwargs)
 
         # analyze regions
-        ra = RegionAnalyzer(
+        bbox_analyzer = RegionAnalyzer(
             RegionAnalyzerConfig(
                 output_type="dataframe", 
                 properties=["bbox"],
                 iterator_config=ArrayIteratorConfig(slice_def=())
             )
         )
-        t_results = ra.run(t_labels, *args, metadata=t_metadata, **kwargs)
+        t_results = bbox_analyzer.run(t_labels, *args, metadata=t_metadata, **kwargs)
 
         # group regions
         divisor = t_labels.shape[-1]//self.config.tile_factor[-1]
@@ -1665,10 +1689,10 @@ class TiledSegmentationFlow(SegmentationFlow):
         else:
             raise ValueError(f"Unsupported number of dimensions: {stack.ndim}")
 
-        # convert labels to masks
+        # convert labels to stack of masks: the stack will have shape (len(t_groups), *t_labels.shape)
         t_masks = labels_to_masks(t_labels)
 
-        # untile
+        # untile: the tiles will be stacked and inserted as new axis 0 in untiled array. The untiled array will have shape (len(t_groups), *t_masks.shape)
         ucfg = UntilerConfig(
             factor = self.config.tile_factor,
             iterator_config = ArrayIteratorConfig(slice_def=())
@@ -1686,4 +1710,21 @@ class TiledSegmentationFlow(SegmentationFlow):
 
         ecfg = ResizeConfig(width=orig_width, height=orig_height, normalize=False, dtype=np.uint16)
         resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
-        return resized_labels
+
+        if resized_labels.shape != stack.shape:
+            logging.error(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
+            raise ValueError(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
+
+        if self.config.region_filter is not None:
+            r_results = self.region_analyzer.run(resized_labels, metadata=metadata, **kwargs)
+            _, removed_labels = self.config.region_filter.run(r_results)
+            label_remover = LabelRemover(
+                LabelRemoverConfig(
+                    iterator_config=ArrayIteratorConfig(slice_def=()),
+                    remap=True,
+                    output_type="stack",
+                    squeeze=False,
+                )
+            )
+            resized_labels, _ = label_remover.run(resized_labels, removed_labels)
+        return resized_labels, t_labels, t_masks, untiled, t_proj
