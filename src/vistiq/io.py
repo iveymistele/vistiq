@@ -14,7 +14,7 @@ from bioio import Dimensions, Scale
 from bioio_base.writer import Writer
 from vistiq.core import Configuration, Configurable
 from prefect import task
-from vistiq.utils import str_to_dict, NamedTuple
+from vistiq.utils import str_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +201,8 @@ def substack_to_slices(substack: Optional[str]) -> Optional[dict[str, slice]]:
 
 
 def unstack_image(
-    data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key: str = "axes"
-) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key: str = "axes", strict: bool = True
+) -> tuple[tuple[np.ndarray, ...], tuple[dict[str, Any], ...]]:
     """Split image data and metadata along a given axis.
 
     Splits the image array along the specified axis and updates metadata accordingly.
@@ -216,8 +216,8 @@ def unstack_image(
         key: Key in metadata dictionary that contains the axes labels. Default is "axes".
 
     Returns:
-        Tuple of (list of split image arrays, list of metadata dictionaries).
-        Each metadata dictionary corresponds to one split array. When splitting channels,
+        ``(data_tuple, metadata_tuple)`` — two tuples of equal length. Each
+        ``metadata_tuple[i]`` describes ``data_tuple[i]``. When splitting channels,
         each metadata dict contains a single channel name.
 
     Examples:
@@ -238,6 +238,13 @@ def unstack_image(
         axis_idx = metadata[key].index(axis)
     else:
         axis_idx = axis
+    if axis_idx is None:
+        if strict:
+            raise ValueError(f"Axis {axis} not found in metadata[{key}]")
+        else:
+            # add axis to data and wrap metadata in a list
+            logger.info(f"Axis {axis} not found in metadata[{key}]. Wrapping data and metadata in tuples.")
+            return (data,), (copy.deepcopy(metadata),)
     data = np.unstack(data, axis=axis_idx)
     new_shape = data[0].shape
     logger.info(
@@ -275,13 +282,13 @@ def unstack_image(
     if "dim_order" in metadata:
         metadata["dim_order"] = dim_str
     if splitting_channels:
-        new_metadata = [
+        new_metadata = tuple(
             copy.deepcopy(metadata) | {"channel_names": [channel_names[i]]}
             for i in range(len(data))
-        ]
+        )
     else:
-        new_metadata = [copy.deepcopy(metadata) for _ in range(len(data))]
-    return data, new_metadata
+        new_metadata = tuple(copy.deepcopy(metadata) for _ in range(len(data)))
+    return tuple(data), new_metadata
 
 
 def squeeze_image(

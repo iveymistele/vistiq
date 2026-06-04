@@ -2,25 +2,25 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Optional, Literal, Any, Union
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ImportString, field_validator, model_validator
 from scipy.ndimage import uniform_filter1d
 from skimage.exposure import rescale_intensity
 
 # segmentation, draw
 from skimage.filters import gaussian
 from skimage.transform import resize
-from joblib import Parallel, delayed
 import logging
 
 from vistiq.core import (
-    Configuration,
     Configurable,
     StackProcessorConfig,
     StackProcessor,
     cli_config,
+    generate_name,
 )
-from prefect import task, flow
-
+from prefect import task
+from vistiq.utils import ArrayIteratorConfig
+from vistiq.workflow import WorkflowConfig, Workflow
 logger = logging.getLogger(__name__)
 
 
@@ -117,19 +117,7 @@ class Preprocessor(StackProcessor):
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Run preprocessing on an image stack.
-
-        Args:
-            stack: Input image stack.
-            workers: Number of workers for per-slice processing.
-            verbose: Verbosity level for parallel processing.
-            metadata: Optional metadata to pass to the processor.
-            *args: Additional positional args for slice processing.
-            **kwargs: Additional keyword arguments to pass to the processor.
-
-        Returns:
-            Tuple of (processed image stack, updated metadata or None).
-        """
+        """Run preprocessing on an image stack."""
         input_dtype = stack.dtype
         logger.info(
             f"Running preprocessor {self.__class__.__name__}, on stack of type {input_dtype}, {np.issubdtype(input_dtype, np.integer)}"
@@ -188,54 +176,48 @@ class Preprocessor(StackProcessor):
         return (preprocessed, updated_metadata)
 
 
-class ProcessChainConfig(Configuration):
+class PreprocessFlowConfig(WorkflowConfig):
     """Configuration for sequential preprocessing pipelines.
 
     Attributes:
-        processors: Ordered list of any registered :class:`~vistiq.core.Configuration`
-            subclasses (e.g. :class:`RescaleConfig`, :class:`DoGConfig`). Each is
-            resolved to its matching :class:`~vistiq.core.Configurable` via the
-            app registry at chain construction time.
+        processors: Ordered list of :class:`PreprocessorConfig` subclasses
+            (e.g. :class:`RescaleConfig`, :class:`DoGConfig`, :class:`FuncProcessorConfig`).
     """
 
-    processors: list[Configuration] = Field(
-        default=[], description="List of Configuration objects to apply in sequence"
+    processors: list[PreprocessorConfig] = Field(
+        default_factory=list,
+        description="Preprocessor configs applied in sequence",
     )
 
 
-class ProcessChain(Configurable):
-    """Apply multiple configurables sequentially to the same stack.
+class PreprocessFlow(Workflow):
+    """Apply multiple preprocessors sequentially to the same stack."""
 
-    Each entry in ``config.processors`` may be any :class:`Configuration`
-    subclass registered with :class:`Configurable` (not limited to
-    :class:`PreprocessorConfig`).
-    """
-
-    def __init__(self, config: ProcessChainConfig):
-        """Initialize the preprocess chain.
+    def __init__(self, config: PreprocessFlowConfig):
+        """Initialize the preprocess flow.
 
         Args:
-            config: Process chain configuration.
+            config: Preprocess flow configuration.
         """
         super().__init__(config)
-        self.processors: list[Configurable] = Configurable.create_many_from_configs(
+        self.processors: list[Preprocessor] = Configurable.create_many_from_configs(
             self.config.processors,
-            expected_type=Configurable[Configuration],
-            error_header="Failed to instantiate ProcessChain processors",
+            expected_type=Preprocessor,
+            error_header="Failed to instantiate PreprocessFlow processors",
         )
-        logger.info(f"Setting up ProcessChain with {",".join([p.__class__.__name__ for p in self.processors])}")
+        logger.info(f"Setting up PreprocessFlow with {",".join([p.__class__.__name__ for p in self.processors])}")
 
     @classmethod
-    def from_config(cls, config: ProcessChainConfig) -> "ProcessChain":
-        """Create a ProcessChain instance from a configuration.
+    def from_config(cls, config: PreprocessFlowConfig) -> "PreprocessFlow":
+        """Create a PreprocessFlow instance from a configuration.
 
         Args:
-            config: Process chain configuration.
+            config: Preprocess flow configuration.
         """
         return cls(config)
 
-    @flow(name="ProcessChain.run")
-    def run(
+    @task(name="PreprocessFlow._run", task_run_name=generate_name)
+    def _run(
         self,
         stack: np.ndarray,
         *args,
@@ -244,19 +226,7 @@ class ProcessChain(Configurable):
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Run configured processing steps in sequence.
-
-        Args:
-            stack: Input image stack.
-            workers: Number of workers used by each processor.
-            verbose: Verbosity level forwarded to each processor.
-            metadata: Optional metadata supplied to processors.
-            *args: Additional positional args forwarded to processors.
-            **kwargs: Additional keyword arguments forwarded to processors.
-
-        Returns:
-            Tuple of (processed image stack, updated metadata or None).
-        """
+        """Run configured processing steps in sequence."""
         current_stack = stack
         current_metadata = metadata
         if isinstance(workers, int):
@@ -268,7 +238,7 @@ class ProcessChain(Configurable):
             else:
                 workers = workers[:len(self.processors)]
 
-        logger.info(f"Running ProcessChain with {len(self.processors)} processors")
+        logger.info(f"Running PreprocessFlow with {len(self.processors)} processors")
         for processor, processor_workers in zip(self.processors, workers):
             result = processor.run(
                 current_stack,
@@ -287,6 +257,24 @@ class ProcessChain(Configurable):
                 current_stack = result
 
         return current_stack, current_metadata
+
+
+class DoGConfig(PreprocessorConfig):
+    """Configuration for Difference of Gaussians (DoG) filtering operations.
+
+    This configuration class defines parameters for applying Difference of Gaussians
+    filtering to image stacks.
+    """
+
+    sigma_low: float | tuple[float, ...] = Field(
+        default=1.0, description="Sigma for the lower Gaussian blur"
+    )
+    sigma_high: float | tuple[float, ...] = Field(
+        default=5.0, description="Sigma for the higher Gaussian blur"
+    )
+    mode: Literal["reflect", "constant", "nearest", "mirror", "wrap"] = Field(
+        default="reflect", description="Border handling mode for Gaussian filtering"
+    )
 
 
 class DoG(Preprocessor):
@@ -328,7 +316,7 @@ class DoG(Preprocessor):
         Returns:
             Difference of Gaussians (DoG) for the single slice.
         """
-        logger.info(f"Processing slice, slice.shape={slice.shape}")
+        logger.debug(f"Processing slice, slice.shape={slice.shape}")
         g_low = gaussian(
             slice,
             sigma=self.config.sigma_low,
@@ -343,36 +331,18 @@ class DoG(Preprocessor):
         )
         return g_low - g_high
 
-    @task(name="DoG.run")
-    def run(self, *args, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Run the DoG filter on an image stack.
-
-        Args:
-            *args: Additional arguments to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
-
-        Returns:
-            Tuple of (DoG filtered image stack, updated metadata or None).
-        """
-        return super().run(*args, **kwargs)
-
-
-class DoGConfig(PreprocessorConfig):
-    """Configuration for Difference of Gaussians (DoG) filtering operations.
-
-    This configuration class defines parameters for applying Difference of Gaussians
-    filtering to image stacks.
-    """
-
-    sigma_low: float | tuple[float, ...] = Field(
-        default=1.0, description="Sigma for the lower Gaussian blur"
-    )
-    sigma_high: float | tuple[float, ...] = Field(
-        default=5.0, description="Sigma for the higher Gaussian blur"
-    )
-    mode: Literal["reflect", "constant", "nearest", "mirror", "wrap"] = Field(
-        default="reflect", description="Border handling mode for Gaussian filtering"
-    )
+#    @task(name="DoG.run")
+#    def run(self, *args, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+#        """Run the DoG filter on an image stack.
+#
+#        Args:
+#            *args: Additional arguments to pass to the processor.
+#            **kwargs: Additional keyword arguments to pass to the processor.
+#
+#        Returns:
+#            Tuple of (DoG filtered image stack, updated metadata or None).
+#        """
+#        return super().run(*args, **kwargs)
 
 
 class Noise2StackConfig(PreprocessorConfig):
@@ -492,25 +462,7 @@ class Noise2Stack(Preprocessor):
     def run(
         self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Denoise an image stack by averaging temporal neighbors.
-
-        This implements a simple, non-learning variant inspired by the Noise2Stack idea:
-        predict each frame from its neighboring frames in time. Here we compute a
-        temporal moving average over the first axis (time), optionally excluding the
-        center frame from the average.
-
-        Args:
-            stack: Input stack with time as first axis. Shapes supported:
-                (T, H, W) or (T, H, W, C).
-            metadata: Optional metadata to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
-
-        Returns:
-            Tuple of (denoised stack with the same shape and dtype as the input, updated metadata or None).
-
-        Raises:
-            ValueError: If configuration parameters are invalid.
-        """
+        """Denoise an image stack by averaging temporal neighbors."""
         window = self.config.window
         exclude_center = self.config.exclude_center
 
@@ -522,17 +474,13 @@ class Noise2Stack(Preprocessor):
         input_dtype = stack.dtype
         work = stack.astype(np.float32, copy=False)
 
-        # Apply temporal moving average along T axis
         avg = uniform_filter1d(work, size=window, axis=0, mode="nearest")
 
         if exclude_center:
-            # With mode='nearest', uniform_filter1d uses an effective window of exactly `window`.
-            # Exclude the center by subtracting the original frame and renormalize.
             denoised = (avg * float(window) - work) / float(window - 1)
         else:
             denoised = avg
 
-        # Cast back to input dtype with clipping for integer types
         if np.issubdtype(input_dtype, np.integer):
             info = np.iinfo(input_dtype)
             denoised = np.clip(denoised, info.min, info.max).astype(
@@ -659,17 +607,7 @@ class Resize(Preprocessor):
     def run(
         self, stack: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
-        """Resize an image stack.
-
-        Args:
-            stack: Input stack.
-            metadata: Optional metadata to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
-
-        Returns:
-            Tuple of (resized stack, updated metadata or None).
-        """
-        # Determine target shape
+        """Resize an image stack."""
         original_shape = stack.shape
         target_shape = list(original_shape)
         if self.config.width is not None and self.config.height is not None:
@@ -720,3 +658,55 @@ class Rescale(Preprocessor):
             slice, out_range=self.config.dtype, in_range=(plow, phigh)
         )
         return scaled
+
+
+class FuncProcessorConfig(PreprocessorConfig):
+    """Configuration for applying an arbitrary function per stack slice."""
+
+    iterator_config: ArrayIteratorConfig = Field(
+        default_factory=lambda: ArrayIteratorConfig(slice_def=())
+    )
+    strict_axis: bool = True
+    func: ImportString | None = None
+    args: list[Any] = Field(default_factory=list)
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+class FuncProcessor(Preprocessor):
+    """Run a configured callable on each iterated slice of the stack."""
+
+    def __init__(self, config: FuncProcessorConfig):
+        super().__init__(config)
+
+    @classmethod
+    def from_config(cls, config: FuncProcessorConfig) -> "FuncProcessor":
+        return cls(config)
+
+    def _process_slice(
+        self, slice: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    ) -> np.ndarray:
+        func = self.config.func
+        args = self.config.args
+        proc_kwargs = self.config.kwargs.copy()
+        if "axis" in proc_kwargs:
+            axis_letters = proc_kwargs["axis"]
+            axis_indices = tuple(
+                (
+                    self._axis_index(metadata, letter)
+                    if isinstance(letter, str)
+                    else letter
+                )
+                for letter in axis_letters
+            )
+            axis_indices = tuple(i for i in axis_indices if i is not None)
+            proc_kwargs["axis"] = axis_indices
+            logger.info(
+                "Mapped axis letters %s to axis indices %s",
+                axis_letters,
+                axis_indices,
+            )
+        results = func(slice, *args, **proc_kwargs)
+        if self.config.dtype is not None and isinstance(results, np.ndarray):
+            results = results.astype(self.config.dtype)
+            logger.info("Converted results to %s", results.dtype)
+        return results

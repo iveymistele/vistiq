@@ -1,5 +1,4 @@
 """Tests for vistiq.workflow module."""
-import numpy as np
 import pytest
 from vistiq.workflow import (
     WorkflowStepConfig,

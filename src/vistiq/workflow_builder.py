@@ -7,8 +7,8 @@ specified via command-line arguments.
 import argparse
 import inspect
 import logging
-from typing import Dict, Type, Any, Optional, List, Tuple, get_type_hints, get_origin, get_args
-from pydantic import BaseModel, Field
+from typing import Dict, Type, Any, Optional, List, Tuple, get_origin, get_args
+from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 
 from vistiq.core import Configuration, Configurable

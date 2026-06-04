@@ -1,17 +1,16 @@
 """Tests for vistiq.preprocess module."""
 import numpy as np
-import pytest
 from vistiq.preprocess import (
     PreprocessorConfig,
     Preprocessor,
-    PreprocessChainConfig,
-    PreprocessChain,
+    PreprocessFlowConfig,
+    PreprocessFlow,
+    RescaleConfig,
     DoGConfig,
     DoG,
     Noise2StackConfig,
     Noise2Stack,
 )
-from vistiq.utils import ArrayIteratorConfig
 
 
 class TestPreprocessorConfig:
@@ -77,29 +76,35 @@ class TestPreprocessor:
         assert processor.config.normalize is False
 
 
-class TestPreprocessChainConfig:
-    """Tests for PreprocessChainConfig class."""
+class TestPreprocessFlowConfig:
+    """Tests for PreprocessFlowConfig class."""
 
     def test_default_config(self):
-        """Test default PreprocessChainConfig."""
-        config = PreprocessChainConfig()
-        assert config.preprocessors == []
+        """Test default PreprocessFlowConfig."""
+        config = PreprocessFlowConfig()
+        assert config.processors == []
+
+    def test_processors_accept_preprocessor_subclasses(self):
+        """Processors must be PreprocessorConfig instances."""
+        config = PreprocessFlowConfig(processors=[RescaleConfig(), DoGConfig()])
+        assert len(config.processors) == 2
+        assert all(isinstance(p, PreprocessorConfig) for p in config.processors)
 
 
-class TestPreprocessChain:
-    """Tests for PreprocessChain class."""
+class TestPreprocessFlow:
+    """Tests for PreprocessFlow class."""
 
     def test_initialization(self):
-        """Test PreprocessChain initialization."""
-        config = PreprocessChainConfig()
-        chain = PreprocessChain(config)
-        assert chain.config == config
+        """Test PreprocessFlow initialization."""
+        config = PreprocessFlowConfig()
+        flow = PreprocessFlow(config)
+        assert flow.config == config
 
     def test_from_config(self):
         """Test from_config class method."""
-        config = PreprocessChainConfig()
-        chain = PreprocessChain.from_config(config)
-        assert isinstance(chain, PreprocessChain)
+        config = PreprocessFlowConfig()
+        flow = PreprocessFlow.from_config(config)
+        assert isinstance(flow, PreprocessFlow)
 
 
 class TestDoGConfig:

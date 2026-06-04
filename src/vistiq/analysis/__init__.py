@@ -1,6 +1,11 @@
 from .coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
+    box_iou_batch_3d,
+    labels_iou_batch_3d,
+    labels_iou_batch_3d_torch,
+    mask_iou_batch_3d,
+    mask_iou_batch_3d_torch,
 )
 from .enrichment import (
     GridDensityFeaturesConfig,
@@ -14,6 +19,11 @@ from .enrichment import (
 __all__ = [
     "CoincidenceDetector",
     "CoincidenceDetectorConfig",
+    "box_iou_batch_3d",
+    "labels_iou_batch_3d",
+    "labels_iou_batch_3d_torch",
+    "mask_iou_batch_3d",
+    "mask_iou_batch_3d_torch",
     "GridDensityFeaturesConfig",
     "NeighborFeaturesConfig",
     "RegionDataFrameEnricher",

@@ -1,7 +1,5 @@
 """Tests for vistiq.seg module."""
 import numpy as np
-import pytest
-from skimage.measure import regionprops
 from vistiq.seg import (
     RangeThresholdConfig,
     RangeThreshold,
@@ -18,7 +16,6 @@ from vistiq.seg import (
     dilate_regions,
     remap_labels,
 )
-from vistiq.utils import ArrayIteratorConfig
 
 
 class TestDilateRegions:
@@ -330,6 +327,14 @@ class TestRegionAnalyzerConfig:
         config = RegionAnalyzerConfig()
         assert config.output_type in ["list", "dataframe"]
         assert isinstance(config.properties, list)
+        for name in RegionAnalyzer.mandatory_properties:
+            assert name in config.properties
+
+    def test_mandatory_object_id_when_properties_omitted(self):
+        """object_id is always present even if properties list is empty."""
+        config = RegionAnalyzerConfig(properties=["area"])
+        assert "object_id" in config.properties
+        assert "label" in config.properties
 
 
 class TestRegionAnalyzer:
@@ -363,6 +368,18 @@ class TestRegionAnalyzer:
         result = analyzer._process_slice(sample_labels_2d)
         # regionprops_table returns a dict-like object that can be converted to DataFrame
         assert isinstance(result, (dict, pd.DataFrame)) or hasattr(result, 'keys')
+        if isinstance(result, pd.DataFrame):
+            assert "object_id" in result.columns
+            assert len(result["object_id"].unique()) == len(result)
+
+    def test_process_slice_list_output_includes_object_id(self, sample_labels_2d):
+        """List output includes object_id on each region."""
+        config = RegionAnalyzerConfig(output_type="list", properties=["area"])
+        analyzer = RegionAnalyzer(config)
+        result = analyzer._process_slice(sample_labels_2d)
+        assert len(result) > 0
+        assert all(hasattr(r, "object_id") for r in result)
+        assert len({r.object_id for r in result}) == len(result)
 
     def test_run(self, sample_labels_2d):
         """Test run method."""

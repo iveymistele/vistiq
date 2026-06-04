@@ -9,7 +9,6 @@ from typing import (
     Union,
     Optional,
     List,
-    NamedTuple,
     Tuple,
     Dict,
     Pattern,
@@ -19,10 +18,8 @@ from collections import defaultdict
 
 import numpy as np
 from pydantic import BaseModel
-import pandas as pd
 
 import cv2
-import tifffile
 import uuid
 import torch
 
@@ -35,6 +32,57 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_futures(value: Any) -> Any:
+    """Resolve Prefect futures/states into concrete values.
+
+    This function intentionally uses a generic name distinct from Prefect's own
+    helpers to avoid naming collisions in notebooks and scripts.
+    """
+    try:
+        from prefect.futures import (
+            PrefectFuture,
+            resolve_futures_to_results,
+            wait as prefect_wait,
+        )
+        from prefect.states import State
+        from prefect.utilities.asyncutils import run_coro_as_sync
+    except Exception:
+        return value
+
+    # First resolve Prefect futures with Prefect's optimized helper.
+    # Wait before resolving to avoid "Run is in PENDING state" race conditions.
+    if isinstance(value, PrefectFuture):
+        prefect_wait([value])
+    elif isinstance(value, list) and value and all(
+        isinstance(v, PrefectFuture) for v in value
+    ):
+        prefect_wait(value)
+    elif isinstance(value, tuple) and value and all(
+        isinstance(v, PrefectFuture) for v in value
+    ):
+        prefect_wait(list(value))
+    elif isinstance(value, dict) and value and all(
+        isinstance(v, PrefectFuture) for v in value.values()
+    ):
+        prefect_wait(list(value.values()))
+
+    resolved = resolve_futures_to_results(value)
+
+    # Then resolve any remaining State objects recursively.
+    if isinstance(resolved, State):
+        result = resolved.result()
+        if hasattr(result, "__await__"):
+            result = run_coro_as_sync(result)
+        return resolve_futures(result)
+    if isinstance(resolved, list):
+        return [resolve_futures(v) for v in resolved]
+    if isinstance(resolved, tuple):
+        return tuple(resolve_futures(v) for v in resolved)
+    if isinstance(resolved, dict):
+        return {k: resolve_futures(v) for k, v in resolved.items()}
+    return resolved
 
 
 def str_to_dict(s: Optional[Union[str, dict]], value_type: Any = None) -> Optional[dict]:
@@ -595,31 +643,201 @@ def load_mp4(
     return video_array
 
 
+def available_accelerator_devices() -> dict[str, list[dict[str, Any]]]:
+    """Return available PyTorch GPU/accelerator backends and devices.
+
+    Keys are backend names (``cuda``, ``mps``, ``xpu``, etc.). Values are lists of
+    device descriptors. Only backends with at least one available device are
+    included. CPU is not included (use :func:`check_device` for a full fallback).
+
+    Each device entry includes:
+        - ``backend``: Backend name (same as the dict key).
+        - ``torch_device``: String accepted by ``torch.device(...)``.
+        - ``index``: Device index when applicable, else ``None``.
+        - ``name``: Human-readable device name when known.
+        - ``available``: Always ``True`` for entries in the result.
+
+    Returns:
+        Mapping of backend name to list of device info dicts, e.g.
+        ``{"cuda": [{"torch_device": "cuda:0", "name": "...", ...}], "mps": [...]}``.
+    """
+    devices: dict[str, list[dict[str, Any]]] = {}
+
+    if torch.cuda.is_available():
+        cuda_devices: list[dict[str, Any]] = []
+        for index in range(torch.cuda.device_count()):
+            try:
+                props = torch.cuda.get_device_properties(index)
+                name = props.name
+                total_memory = getattr(props, "total_memory", None)
+            except Exception:
+                name = "unknown"
+                total_memory = None
+            entry: dict[str, Any] = {
+                "backend": "cuda",
+                "torch_device": f"cuda:{index}",
+                "index": index,
+                "name": name,
+                "available": True,
+            }
+            if total_memory is not None:
+                entry["total_memory_bytes"] = int(total_memory)
+            cuda_devices.append(entry)
+        if cuda_devices:
+            devices["cuda"] = cuda_devices
+
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None:
+        built = bool(torch.backends.mps.is_built())
+        available = bool(torch.backends.mps.is_available())
+        if available:
+            devices["mps"] = [
+                {
+                    "backend": "mps",
+                    "torch_device": "mps",
+                    "index": None,
+                    "name": "Apple Metal (MPS)",
+                    "available": True,
+                    "built": built,
+                }
+            ]
+
+    xpu_mod = getattr(torch, "xpu", None)
+    if xpu_mod is not None and getattr(xpu_mod, "is_available", lambda: False)():
+        xpu_devices: list[dict[str, Any]] = []
+        device_count_fn = getattr(xpu_mod, "device_count", lambda: 0)
+        for index in range(device_count_fn()):
+            try:
+                name = xpu_mod.get_device_name(index)
+            except Exception:
+                name = "unknown"
+            xpu_devices.append(
+                {
+                    "backend": "xpu",
+                    "torch_device": f"xpu:{index}",
+                    "index": index,
+                    "name": name,
+                    "available": True,
+                }
+            )
+        if xpu_devices:
+            devices["xpu"] = xpu_devices
+
+    return devices
+
+
 def check_device() -> torch.device:
     """Determine the best available PyTorch device (cuda, mps, or cpu).
 
     Returns:
-        torch.device: The selected device in priority order cuda > mps > cpu.
+        torch.device: The selected device in priority order cuda > mps > xpu > cpu.
     """
-    # Prefer CUDA when available
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        device = torch.device("cuda")
-        try:
-            name = torch.cuda.get_device_name(0)
-        except Exception:
-            name = "unknown"
-        logger.info("Found CUDA device: %s", name)
-        return device
+    accelerators = available_accelerator_devices()
+    for backend in ("cuda", "mps", "xpu"):
+        entries = accelerators.get(backend)
+        if entries:
+            device = torch.device(entries[0]["torch_device"])
+            logger.info(
+                "Found %s device: %s",
+                backend,
+                entries[0].get("name", entries[0]["torch_device"]),
+            )
+            return device
 
-    # Fallback to Apple Metal Performance Shaders on macOS
-    mps_ok = getattr(torch.backends, "mps", None)
-    if mps_ok and torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        logger.info("Found MPS device")
-        return torch.device("mps")
-
-    # Default to CPU
     logger.info("Falling back to CPU device")
     return torch.device("cpu")
+
+
+def set_fractional_memory(
+    fraction: float,
+    device: Union[torch.device, str, int],
+) -> bool:
+    """Limit per-process accelerator memory use to a fraction of device capacity.
+
+    Backend support:
+        - **CUDA**: ``torch.cuda.set_per_process_memory_fraction(fraction, device=index)``
+        - **MPS**: ``torch.mps.set_per_process_memory_fraction(fraction)`` (PyTorch >= 2.5;
+          no device index; must be called before tensors are allocated on MPS)
+        - **XPU**: ``torch.xpu.set_per_process_memory_fraction`` when available
+        - **CPU**: not supported (returns ``False``)
+
+    Args:
+        fraction: Share of device memory to allow. For CUDA/XPU, use ``(0.0, 1.0]``.
+            For MPS, PyTorch accepts ``0.0``–``2.0`` (``0.0`` = unlimited).
+        device: Target device, compatible with :func:`check_device` output:
+            ``torch.device`` (e.g. ``cuda:0``, ``mps``, ``cpu``), device string,
+            or CUDA/XPU device index. Ignored for MPS (single device).
+
+    Returns:
+        ``True`` if a memory limit was applied, ``False`` if unsupported on this
+        backend/version (e.g. MPS on older PyTorch without the API).
+
+    Raises:
+        ValueError: If ``fraction`` is out of range or CUDA/XPU is unavailable
+            when requested.
+    """
+    if isinstance(device, int):
+        backend = "cuda"
+        device_index = device
+    else:
+        torch_device = device if isinstance(device, torch.device) else torch.device(device)
+        backend = torch_device.type
+        device_index = torch_device.index if torch_device.index is not None else 0
+
+    if backend == "cuda":
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"fraction must be in (0.0, 1.0] for CUDA, got {fraction}")
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is not available; cannot set fractional memory.")
+        torch.cuda.set_per_process_memory_fraction(fraction, device=device_index)
+        logger.info(
+            "Set CUDA memory fraction to %s on device cuda:%s",
+            fraction,
+            device_index,
+        )
+        return True
+
+    if backend == "mps":
+        if not (0.0 <= fraction <= 2.0):
+            raise ValueError(
+                f"fraction must be in [0.0, 2.0] for MPS, got {fraction}"
+            )
+        mps_mod = getattr(torch, "mps", None)
+        setter = getattr(mps_mod, "set_per_process_memory_fraction", None)
+        if (
+            mps_mod is not None
+            and getattr(torch.backends.mps, "is_available", lambda: False)()
+            and setter is not None
+        ):
+            setter(fraction)
+            logger.info("Set MPS memory fraction to %s", fraction)
+            return True
+        logger.info(
+            "torch.mps.set_per_process_memory_fraction is unavailable in this "
+            "PyTorch build; set PYTORCH_MPS_HIGH_WATERMARK_RATIO before import instead."
+        )
+        return False
+
+    if backend == "xpu":
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError(f"fraction must be in (0.0, 1.0] for XPU, got {fraction}")
+        xpu_mod = getattr(torch, "xpu", None)
+        setter = getattr(xpu_mod, "set_per_process_memory_fraction", None)
+        if xpu_mod is not None and getattr(xpu_mod, "is_available", lambda: False)() and setter:
+            setter(fraction, device=device_index)
+            logger.info(
+                "Set XPU memory fraction to %s on device xpu:%s",
+                fraction,
+                device_index,
+            )
+            return True
+        raise ValueError("XPU is not available; cannot set fractional memory.")
+
+    logger.info(
+        "Fractional memory limits are not supported for device type '%s'; skipping.",
+        backend,
+    )
+    return False
 
 
 def to_mp4(path: Union[str, os.PathLike], stack: np.ndarray, fps: int = 15) -> None:

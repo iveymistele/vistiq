@@ -1,10 +1,11 @@
 import logging
+import uuid
 from functools import wraps
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from prefect import task
 from skimage.measure import label as sk_label, regionprops, regionprops_table, perimeter
 
@@ -19,9 +20,28 @@ class RegionAnalyzer(StackProcessor):
 
     Computes properties for each labeled region, including built-in properties
     from scikit-image and custom extra properties like circularity and aspect ratio.
+    Every run includes ``label`` and a unique ``object_id`` per region
+    (:attr:`mandatory_properties`).
     """
 
-    default_properties: List[str] = ["label", "centroid"]
+    mandatory_properties: ClassVar[tuple[str, ...]] = ("label", "object_id")
+    default_properties: ClassVar[tuple[str, ...]] = mandatory_properties + ("centroid",)
+    # Assigned after regionprops; not passed as a scikit-image extra_property.
+    postcomputed_properties: ClassVar[frozenset[str]] = frozenset({"object_id"})
+
+    @classmethod
+    def ensure_mandatory_properties(cls, properties: List[str]) -> List[str]:
+        """Return *properties* with :attr:`mandatory_properties` present (stable order)."""
+        props = list(properties)
+        for name in cls.mandatory_properties:
+            if name not in props:
+                if name == "label":
+                    props.insert(0, name)
+                elif "label" in props:
+                    props.insert(props.index("label") + 1, name)
+                else:
+                    props.insert(0, name)
+        return props
 
     def __init__(self, config: "RegionAnalyzerConfig"):
         """Initialize the region analyzer.
@@ -56,6 +76,8 @@ class RegionAnalyzer(StackProcessor):
             "sphericity": cls.sphericity,
             "aspect_ratio": cls.aspect_ratio,
             "cross_sectional_area": cls.cross_sectional_area,
+            "cross_sectional_area_xz": cls.cross_sectional_area_xz,
+            "cross_sectional_area_yz": cls.cross_sectional_area_yz,
             "volume": cls.volume,
         }
 
@@ -69,6 +91,7 @@ class RegionAnalyzer(StackProcessor):
         return sorted(
             RegionAnalyzer.builtin_properties()
             + list(RegionAnalyzer.extra_properties_funcs().keys())
+            + list(RegionAnalyzer.postcomputed_properties)
         )
 
     def used_extra_properties(self) -> List[str]:
@@ -81,7 +104,8 @@ class RegionAnalyzer(StackProcessor):
             [
                 prop
                 for prop in self.config.properties
-                if prop in RegionAnalyzer.extra_properties_funcs().keys()
+                if prop in RegionAnalyzer.extra_properties_funcs()
+                and prop not in RegionAnalyzer.postcomputed_properties
             ]
         )
 
@@ -157,6 +181,25 @@ class RegionAnalyzer(StackProcessor):
             A new RegionProcessor instance.
         """
         return cls(config)
+
+    @staticmethod
+    def new_object_id() -> str:
+        """Return a new unique object id (thread/process safe via :func:`uuid.uuid4`)."""
+        return uuid.uuid4().hex
+
+    def _assign_object_ids(
+        self, results: List[Any] | pd.DataFrame
+    ) -> List[Any] | pd.DataFrame:
+        """Attach a unique ``object_id`` to each region after regionprops."""
+        if isinstance(results, list):
+            for region in results:
+                setattr(region, "object_id", self.new_object_id())
+        elif isinstance(results, pd.DataFrame):
+            n = len(results)
+            if n:
+                results = results.copy()
+                results["object_id"] = [self.new_object_id() for _ in range(n)]
+        return results
 
     @staticmethod
     def circularity(regionmask, intensity_image=None, spacing=None):
@@ -318,6 +361,49 @@ class RegionAnalyzer(StackProcessor):
         return pixel_count
 
     @staticmethod
+    def cross_sectional_area_xz(regionmask, intensity_image=None, spacing=None):
+        """Compute the maximum cross-sectional area in the xz plane of the region.
+
+        Args:
+            regionmask: Binary mask of the region.
+            intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.
+        Returns:
+            Maximum cross-sectional area as a float.
+        """
+        # Sum along the last two spatial dimensions (typically Y and X)
+        pixel_count = float(np.max(np.sum(regionmask, axis=(-3, -1))))
+
+        if spacing is not None:
+            # Calculate physical area accounting for pixel spacing
+            pixel_area = np.abs(np.prod(spacing[-2:]))
+            return pixel_count * pixel_area
+
+        return pixel_count
+
+    @staticmethod
+    def cross_sectional_area_yz(regionmask, intensity_image=None, spacing=None):
+        """Compute the maximum cross-sectional area in the yz plane of the region.
+
+        Args:
+            regionmask: Binary mask of the region.
+            intensity_image: Optional intensity image (not used).
+            spacing: Optional spacing tuple for anisotropic voxels.
+        Returns:
+            Maximum cross-sectional area as a float.
+        """
+        # Sum along the last two spatial dimensions (typically Y and X)
+        pixel_count = float(np.max(np.sum(regionmask, axis=(-3, -2))))
+
+        if spacing is not None:
+            # Calculate physical area accounting for pixel spacing
+            pixel_area = np.abs(np.prod(spacing[-2:]))
+            return pixel_count * pixel_area
+
+        return pixel_count
+
+
+    @staticmethod
     def volume(regionmask, intensity_image=None, spacing=None):
         """Compute volume: sum of all pixels/voxels in the region mask.
 
@@ -351,7 +437,7 @@ class RegionAnalyzer(StackProcessor):
         return pixel_count
 
     def _process_slice(
-        self, labels: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+        self, labels: np.ndarray, slice_annotations: Optional[dict[str, Any]] = None, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> List["RegionProperties"] | pd.DataFrame:
         """Process a single slice to extract region properties.
 
@@ -374,7 +460,7 @@ class RegionAnalyzer(StackProcessor):
         if spacing is not None:
             spacing = spacing[-labels.ndim :]
         debug_mask_labels("RegionAnalyzer._process_slice", labels)
-        logger.info(f"RegionAnalyzer: Applying scale: {spacing}")
+        logger.info(f"RegionAnalyzer: Applying scale: {spacing}, labels.shape={labels.shape}, metadata['channel_names']={metadata.get('channel_names', None)}")
 
         # Get extra_properties functions with spacing wrapped in
         extra_props_funcs = self.used_extra_properties_funcs(spacing=spacing)
@@ -396,6 +482,9 @@ class RegionAnalyzer(StackProcessor):
             raise ValueError(
                 f"Invalid output type: {self.config.output_type}. Allowed output types are: list, dataframe"
             )
+
+        if "object_id" in self.config.properties:
+            results = self._assign_object_ids(results)
 
         if isinstance(results, list):
             logger.debug(
@@ -451,9 +540,9 @@ class RegionAnalyzer(StackProcessor):
         logger.debug("DEBUG: entered RegionAnalyzer.run")
         logger.debug("DEBUG: labels shape =", getattr(labels, "shape", None))
         # debug_mask_labels("RegionAnalyzer.run", labels)
-        results = super().run(labels, metadata=metadata, **kwargs)
+        results,_ = super().run(labels, metadata=metadata, **kwargs)
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
-        return results[0]
+        return results
 
 
 class RegionAnalyzerConfig(StackProcessorConfig):
@@ -461,35 +550,36 @@ class RegionAnalyzerConfig(StackProcessorConfig):
 
     Attributes:
         output_type: Output format ("list" for RegionProperties list, "dataframe" for pandas DataFrame).
-        properties: List of property names to compute. "label" is always included.
+        properties: List of property names to compute. ``label`` and ``object_id``
+            are always included (see :attr:`RegionAnalyzer.mandatory_properties`).
     """
 
     output_type: Literal["list", "dataframe"] = "list"
-    properties: List[str] = RegionAnalyzer.default_properties
+    properties: List[str] = Field(
+        default_factory=lambda: list(RegionAnalyzer.default_properties)
+    )
 
     @field_validator("properties")
     @classmethod
     def validate_properties(cls, v: List[str]) -> List[str]:
-        """Validate that all properties are allowed and include "label".
+        """Validate property names and ensure mandatory outputs are present.
 
         Args:
             v: List of property names to validate.
 
         Returns:
-            Validated list with "label" added if missing.
+            Validated list including ``label`` and ``object_id``.
 
         Raises:
             ValueError: If any property is not in the allowed list.
         """
         if v is None or len(v) == 0:
-            return RegionAnalyzer.default_properties
+            v = list(RegionAnalyzer.default_properties)
         elif not set(v).issubset(set(RegionAnalyzer.allowed_properties())):
             raise ValueError(
                 f"One or more invalid properties: {v}. Allowed properties are: {RegionAnalyzer.allowed_properties()}"
             )
-        if "label" not in v:
-            v = ["label"] + v
-        return v
+        return RegionAnalyzer.ensure_mandatory_properties(v)
 
     @model_validator(mode="after")
     def validate_properties_iterator(self) -> "RegionAnalyzerConfig":
@@ -499,35 +589,36 @@ class RegionAnalyzerConfig(StackProcessorConfig):
         - "area" and "volume": If iterator_config.slice_def has length < 3: use "area", otherwise use "volume"
         - "circularity" and "sphericity": If iterator_config.slice_def has length < 3: use "circularity", otherwise use "sphericity"
 
+        Mutates a local list and assigns once with ``object.__setattr__`` so
+        ``validate_assignment`` does not re-enter this validator (infinite loop).
+
         Returns:
             Validated configuration.
         """
-        if self.properties is None or len(self.properties) == 0:
-            self.properties = RegionAnalyzer.default_properties
+        props = (
+            list(self.properties)
+            if self.properties
+            else list(RegionAnalyzer.default_properties)
+        )
 
-        # Check if both "area" and "volume" are present
-        has_area = "area" in self.properties
-        has_volume = "volume" in self.properties
-
+        has_area = "area" in props
+        has_volume = "volume" in props
         slice_def_len = len(self.iterator_config.slice_def)
 
-        # Handle area/volume mutual exclusivity
         if has_area and slice_def_len >= 3:
-            self.properties = [p for p in self.properties if p != "area"] + ["volume"]
+            props = [p for p in props if p != "area"] + ["volume"]
         if has_volume and slice_def_len < 3:
-            self.properties = [p for p in self.properties if p != "volume"] + ["area"]
+            props = [p for p in props if p != "volume"] + ["area"]
 
-        # Handle circularity/sphericity mutual exclusivity
-        has_circularity = "circularity" in self.properties
-        has_sphericity = "sphericity" in self.properties
+        has_circularity = "circularity" in props
+        has_sphericity = "sphericity" in props
 
         if has_circularity and slice_def_len >= 3:
-            self.properties = [p for p in self.properties if p != "circularity"] + [
-                "sphericity"
-            ]
+            props = [p for p in props if p != "circularity"] + ["sphericity"]
         if has_sphericity and slice_def_len < 3:
-            self.properties = [p for p in self.properties if p != "sphericity"] + [
-                "circularity"
-            ]
+            props = [p for p in props if p != "sphericity"] + ["circularity"]
 
+        props = RegionAnalyzer.ensure_mandatory_properties(props)
+        if props != self.properties:
+            object.__setattr__(self, "properties", props)
         return self

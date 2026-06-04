@@ -85,8 +85,8 @@ class RangeFilter(Configurable):
         """
         self.config.range = (target_value - tolerance, target_value + tolerance)
 
-    def in_range(self, value: float) -> bool:
-        """Check if a value falls within the filter range.
+    def accept(self, value: float) -> bool:
+        """Return whether a value is accepted by this filter's range.
 
         Args:
             value: Value to check.
@@ -248,7 +248,7 @@ class RegionFilter(Configurable[RegionFilterConfig]):
                         continue
 
                     value = row[filter.config.attribute]
-                    if not filter.in_range(value):
+                    if not filter.accept(value):
                         removed_indices.append(idx)
                         break
 
@@ -286,7 +286,7 @@ class RegionFilter(Configurable[RegionFilterConfig]):
         for region in regions:
             for filter in self.config.filters:
                 value = getattr(region, filter.config.attribute)
-                if not filter.in_range(value):
+                if not filter.accept(value):
                     # logger.debug(
                     #    f"filter {filter.config.attribute} value={value} not in range for region {region.label}"
                     # )

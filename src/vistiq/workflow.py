@@ -1,6 +1,4 @@
-import numpy as np
-from typing import List, Optional, Any
-from pydantic import BaseModel
+from typing import Optional, Any
 import logging
 
 from vistiq.core import (
@@ -8,7 +6,10 @@ from vistiq.core import (
     Configuration,
     StackProcessor,
     StackProcessorConfig,
+    generate_flow_name,
+    generate_name,
 )
+from vistiq.utils import resolve_futures
 from prefect import task, flow
 
 logger = logging.getLogger(__name__)
@@ -98,8 +99,41 @@ class Workflow(Configurable):
     #        """
     #        self.config = config
 
-    @flow(name="Workflow.run")
-    def run(
+    @flow(name="Workflow.mapped_run", flow_run_name=generate_flow_name)
+    def mapped_run(self, *args, resolve: bool = False, **kwargs) -> Any:
+        """Run the workflow component on a list of images.
+
+        Args:
+            *args: list of inputs to be processed.
+            resolve: If ``True``, block and return resolved mapped results.
+                If ``False`` (default), return Prefect futures for chaining into
+                subsequent mapped calls without introducing a barrier.
+            **kwargs: list of additional keyword arguments to pass to the workflow.
+        """
+        futures = self._run.map(*args, **kwargs)
+        if not resolve:
+            return futures
+
+        results = resolve_futures(futures)
+        if not results:
+            return []
+        if isinstance(results[0], tuple):
+            return tuple(list(items) for items in zip(*results))
+        return results
+
+
+    @flow(name="Workflow.run", flow_run_name=generate_flow_name)
+    def run(self, *args, **kwargs) -> Any:
+        """Run the workflow component on an image.
+
+        Args:
+            *args: Inputs to be processed.
+            **kwargs: Additional keyword arguments to pass to the workflow.
+        """
+        return self._run(*args, **kwargs)
+
+    @task(name="Workflow._run", task_run_name=generate_name)
+    def _run(
         self,
         input: Any,
         *args,

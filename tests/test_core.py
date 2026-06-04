@@ -3,7 +3,6 @@ import numpy as np
 import pytest
 from vistiq.core import (
     Configuration,
-    Configurable,
     StackProcessorConfig,
     StackProcessor,
     ChainProcessorConfig,

@@ -19,20 +19,22 @@ from pydantic import field_validator, model_validator, PositiveInt
 from skimage.measure import label as sk_label
 
 from vistiq.core import (
+    Configurable,
     StackProcessor,
     StackProcessorConfig,
-    FuncProcessor, 
-    FuncProcessorConfig,
     Tiler,
     TilerConfig,
     Untiler,
     UntilerConfig,
+    generate_name,
+    labels_to_masks,
 )
 from vistiq.utils import (
     ArrayIterator,
     ArrayIteratorConfig,
     array_content_digest,
-    create_unique_folder,
+    check_device,
+    set_fractional_memory,
 )
 from vistiq.preprocess import (
     Resize, 
@@ -49,6 +51,7 @@ from vistiq.segment.postprocess import (
 )
 from vistiq.segment.select import (
     RegionFilter,
+    RegionFilterConfig,
 )
 from vistiq.segment.threshold import (
     OtsuThreshold,
@@ -1170,8 +1173,8 @@ class IterativeSegmenter(Workflow):
                 raise ValueError(f"Mask must be 2D or 3D, got {mask.ndim}D")
         return mask
 
-    @task(name="IterativeSegmenter.run")
-    def run(
+    @task(name="IterativeSegmenter._run", task_run_name=generate_name)
+    def _run(
         self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the iterative segmentation workflow.
@@ -1280,8 +1283,8 @@ class SeriesSegmenter(Workflow):
         """
         super().__init__(config)
 
-    @task(name="SeriesSegmenter.run")
-    def run(
+    @task(name="SeriesSegmenter._run", task_run_name=generate_name)
+    def _run(
         self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the series of segmenters on an image.
@@ -1349,6 +1352,9 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     output_mode: str = "instance_segmentation"
     with_background: bool = True
     device: Optional[str] = None
+    device_no: int = 0
+    gpu_fraction: float = 1.0
+    preferred_backend: Literal["processes", "threads"] = "processes"
     # ndim: Optional[int] = None # image specific, should be set at runtime if needed
 
 
@@ -1393,33 +1399,42 @@ class MicroSAMSegmenter(Segmenter):
     def _process_slice(
         self, img_slice: np.ndarray, mask_path:Optional[Union[Union[PathLike, str], np.ndarray]] = None,metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
-        if self.config.embedding_path is None:
-            self.config.embedding_path = (
-                os.path.expanduser()
-            )  # create_unique_folder(base_path="embeddings")
-        arr_hash = array_content_digest(img_slice)
-        embedding_path = os.path.join(self.config.embedding_path, arr_hash)
-        os.makedirs(embedding_path, exist_ok=True)
-        logger.info(
-            f"Using {embedding_path} for embeddings. img_slice.shape={img_slice.shape}"
-        )
+        import torch
+        if self.config.device is not None:
+            device = self.config.device
+        else:
+            device = check_device()
+        with torch.device(device):
+            set_fractional_memory(self.config.gpu_fraction, device=device)
 
-        labels = automatic_instance_segmentation(
-            predictor=self.predictor,
-            segmenter=self.segmenter,
-            input_path=img_slice,
-            embedding_path=embedding_path,
-            # ndim=self.config.ndim,
-            # pred_iou_thresh=self.config.pred_iou_thresh,
-            # stability_score_thresh=self.config.stability_score_thresh,
-            # box_nms_thresh=self.config.box_nms_thresh,
-            # crop_nms_thresh=self.config.crop_nms_thresh,
-            # min_mask_region_area=self.config.min_mask_region_area,
-            # output_mode=self.config.output_mode,
-            # with_background=self.config.with_background,
-            # mask_path=mask_path,
-            # device=self.config.device,
-        )
+            if self.config.embedding_path is None:
+                self.config.embedding_path = (
+                    os.path.expanduser()
+                )  # create_unique_folder(base_path="embeddings")
+            arr_hash = array_content_digest(img_slice)
+            embedding_path = os.path.join(self.config.embedding_path, arr_hash)
+            os.makedirs(embedding_path, exist_ok=True)
+            logger.info(
+                f"Using {embedding_path} for embeddings. img_slice.shape={img_slice.shape}"
+            )
+
+            labels = automatic_instance_segmentation(
+                predictor=self.predictor,
+                segmenter=self.segmenter,
+                input_path=img_slice,
+                embedding_path=embedding_path,
+                # ndim=self.config.ndim,
+                # pred_iou_thresh=self.config.pred_iou_thresh,
+                # stability_score_thresh=self.config.stability_score_thresh,
+                # box_nms_thresh=self.config.box_nms_thresh,
+                # crop_nms_thresh=self.config.crop_nms_thresh,
+                # min_mask_region_area=self.config.min_mask_region_area,
+                # output_mode=self.config.output_mode,
+                # with_background=self.config.with_background,
+                # mask_path=mask_path,
+                # device=self.config.device,
+            )
+        
         return labels
 
 
@@ -1463,29 +1478,25 @@ class SegmentationFlowConfig(WorkflowConfig):
     for producing label arrays; other fields refine or filter those labels.
 
     Attributes:
-        segmenter: Segmenter that converts an image stack into label arrays.
-            Its ``iterator_config`` also drives relabeling after merging.
-        merger: Optional merger (e.g. :class:`MicroSAMMerger`) to link
-            per-slice instance labels into a 3D-consistent volume. Skipped when
-            ``None``.
-        region_analyzer: Optional analyzer for region properties. If omitted
-            and ``region_filter`` is set, a :class:`RegionAnalyzer` is created
-            automatically with properties required by the filter.
-        region_filter: Optional filter that removes regions by measured
-            properties; removed labels are cleared from the output mask.
+        segmenter: Configuration for the segmenter (e.g.
+            :class:`MicroSAMSegmenterConfig`). Instantiated per run in
+            :meth:`SegmentationFlow._run`. Its ``iterator_config`` also drives
+            relabeling when ``relabeler`` is omitted.
+        merger: Optional merger configuration (e.g. :class:`MicroSAMMergerConfig`).
+            Skipped when ``None``.
+        region_filter: Optional filter configuration. When set, a
+            :class:`RegionAnalyzer` and :class:`RegionFilter` are created per
+            run with properties required by the filter.
+        relabeler: Optional relabeler configuration. When ``None``, a
+            :class:`Relabeler` is built from ``segmenter.iterator_config``.
     """
 
-    segmenter: Segmenter = None
-    merger: Optional[Merger] = None
+    segmenter: SegmenterConfig = None
+    merger: Optional[MergerConfig] = None
     # include_mask_detector: OverlapDetector
     # exclude_mask_detector: OverlapDetector
-    region_analyzer: Optional[RegionAnalyzer] = (
-        None  # RegionAnalyzer(RegionAnalyzerConfig(output_type="list", properties=RegionAnalyzer.default_properties))
-    )
-    region_filter: Optional[RegionFilter] = None
-    # label_remover: Optional[LabelRemover] = None
-    # do_labels: bool = True
-    # do_regions: bool = False
+    region_filter: Optional[RegionFilterConfig] = None
+    relabeler: Optional[RelabelerConfig] = None
 
 
 class SegmentationFlow(Workflow):
@@ -1504,51 +1515,41 @@ class SegmentationFlow(Workflow):
 
         flow = SegmentationFlow(
             SegmentationFlowConfig(
-                segmenter=MicroSAMSegmenter(mscfg),
-                merger=MicroSAMMerger(mmcfg),
-                region_filter=my_filter,
+                segmenter=mscfg,
+                merger=mmcfg,
+                region_filter=rfcfg,
             )
         )
         labels = flow.run(img, metadata=metadata)
     """
 
-    def __init__(self, config: SegmentationFlowConfig):
-        """Initialize the workflow.
-
-        Args:
-            config: Segmentation flow configuration. When ``region_filter`` is set
-                but ``region_analyzer`` is not, a default analyzer is created
-                with properties needed by the filter.
-        """
-        super().__init__(config)
-        if (
-            self.config.region_filter is not None
-            and self.config.region_filter.config.filters is not None
-        ):
-            # Set properties based on region_filter if present, otherwise use defaults
-            # Extract filter attributes to ensure RegionAnalyzer computes them
-            filter_attributes = [
-                filter.config.attribute
-                for filter in self.config.region_filter.config.filters
-                if filter.config.attribute is not None
-            ]
-            # Combine default properties with filter attributes (avoid duplicates)
-            properties = list(RegionAnalyzer.default_properties)
-            properties += [attr for attr in filter_attributes if attr not in properties]
-            logger.info(
-                f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {properties}"
+    @staticmethod
+    def _region_analyzer_for_filter(
+        region_filter_config: RegionFilterConfig,
+        iterator_config: ArrayIteratorConfig,
+    ) -> RegionAnalyzer:
+        """Build a :class:`RegionAnalyzer` with properties required by the filter config."""
+        filter_attributes = [
+            f.config.attribute
+            for f in region_filter_config.filters
+            if f.config.attribute is not None
+        ]
+        properties = list(RegionAnalyzer.default_properties)
+        properties += [attr for attr in filter_attributes if attr not in properties]
+        logger.info(
+            "Creating RegionAnalyzer for region filter with properties: %s",
+            properties,
+        )
+        return RegionAnalyzer(
+            RegionAnalyzerConfig(
+                iterator_config=iterator_config,
+                output_type="list",
+                properties=properties,
             )
-            self.region_analyzer = RegionAnalyzer(
-                RegionAnalyzerConfig(
-                    iterator_config=self.config.segmenter.config.iterator_config,
-                    output_type="list",
-                    properties=properties,
-                )
-            )
-        logger.info(f"Segmenter config: {self.config}")
+        )
 
-    @task(name="Segmenter.run")
-    def run(
+    @task(name="SegmentationFlow._run", task_run_name=generate_name)
+    def _run(
         self,
         img: np.ndarray,
         *args,
@@ -1572,12 +1573,17 @@ class SegmentationFlow(Workflow):
         Returns:
             Segmentation label array.
         """
-        # process the image
-        raw_labels, _ = self.config.segmenter.run(img, *args, metadata=metadata, **kwargs)
+        logging.info(f"SegmentationFlow _run: channel_names={metadata.get('channel_names', None)}, channel_axis={metadata.get('channel_axis', None)}, axes={metadata.get('axes', None)}")
 
-        # merge labels
+        if self.config.segmenter is None:
+            raise ValueError("SegmentationFlowConfig.segmenter is required")
+
+        segmenter = Configurable.create_from_config(self.config.segmenter)
+        raw_labels, _ = segmenter.run(img, *args, metadata=metadata, **kwargs)
+
         if self.config.merger is not None:
-            labels = self.config.merger.run(raw_labels,*args, metadata=metadata, **kwargs)
+            merger = Configurable.create_from_config(self.config.merger)
+            labels = merger.run(raw_labels, *args, metadata=metadata, **kwargs)
         else:
             labels = raw_labels
 
@@ -1586,26 +1592,37 @@ class SegmentationFlow(Workflow):
             for mask in include_masks:
                 labels = labels * mask
         if exclude_masks is not None:
-            for mask in include_masks:
+            for mask in exclude_masks:
                 labels = labels * ~mask
 
         # update the labels to ensure they are unique across the substacks
         l_before = np.unique(labels)
-        iterator_config = self.config.segmenter.config.iterator_config
-        relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
-        labels = relabeler.run(labels,*args, metadata=metadata, **kwargs)
+        if self.config.relabeler is not None:
+            relabeler = Configurable.create_from_config(self.config.relabeler)
+        else:
+            relabeler = Relabeler(
+                RelabelerConfig(
+                    iterator_config=self.config.segmenter.iterator_config,
+                )
+            )
+        labels = relabeler.run(labels, *args, metadata=metadata, **kwargs)
         l_after = np.unique(labels)
         logger.debug(f"Relabeler: l_before == l_after:{l_before == l_after}")
 
         # filter labels based on region properties
         if self.config.region_filter is not None:
-            regions = self.region_analyzer.run(labels,*args, metadata=metadata, **kwargs)
-            # Flatten regions if it's a list of lists (from iterator processing)
+            iterator_config = self.config.segmenter.iterator_config
+            region_analyzer = self._region_analyzer_for_filter(
+                self.config.region_filter,
+                iterator_config,
+            )
+            regions = region_analyzer.run(labels, *args, metadata=metadata, **kwargs)
             if isinstance(regions, list) and len(regions) > 0:
                 # Check if first element is a list (nested structure from iterator)
                 if isinstance(regions[0], list):
                     regions = [region for sublist in regions for region in sublist]
-            regions, removed_labels = self.config.region_filter.run(regions)
+            region_filter = Configurable.create_from_config(self.config.region_filter)
+            regions, removed_labels = region_filter.run(regions)
             # remove the areas in labels corresponding to the removed regions
             label_remover = LabelRemover(
                 LabelRemoverConfig(
@@ -1635,8 +1652,8 @@ class TiledSegmentationFlow(SegmentationFlow):
         super().__init__(config)
 
 
-    @task(name="TiledSegmentationFlow.run")
-    def run(
+    @task(name="TiledSegmentationFlow._run", task_run_name=generate_name)
+    def _run(
         self,
         stack: np.ndarray,
         *args,
@@ -1667,7 +1684,7 @@ class TiledSegmentationFlow(SegmentationFlow):
         t_stack,t_metadata = Tiler(tcfg).run(r_stack, *args,metadata=r_metadata, **kwargs)
 
         # run segmentation on tiled stack
-        t_labels = super().run(t_stack, *args,metadata=t_metadata, **kwargs)
+        t_labels = super()._run(t_stack, *args, metadata=t_metadata, **kwargs)
 
         # analyze regions
         bbox_analyzer = RegionAnalyzer(
@@ -1716,8 +1733,15 @@ class TiledSegmentationFlow(SegmentationFlow):
             raise ValueError(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
 
         if self.config.region_filter is not None:
-            r_results = self.region_analyzer.run(resized_labels, metadata=metadata, **kwargs)
-            _, removed_labels = self.config.region_filter.run(r_results)
+            region_analyzer = self._region_analyzer_for_filter(
+                self.config.region_filter,
+                self.config.segmenter.iterator_config,
+            )
+            r_results = region_analyzer.run(
+                resized_labels, metadata=metadata, **kwargs
+            )
+            region_filter = Configurable.create_from_config(self.config.region_filter)
+            _, removed_labels = region_filter.run(r_results)
             label_remover = LabelRemover(
                 LabelRemoverConfig(
                     iterator_config=ArrayIteratorConfig(slice_def=()),
