@@ -29,7 +29,12 @@ from prefect.runtime import flow_run
 from functools import wraps
 from joblib import Parallel, delayed
 from bioio import Dimensions, Scale
-from vistiq.utils import ArrayIterator, ArrayIteratorConfig
+from vistiq.utils import (
+    ArrayIterator,
+    ArrayIteratorConfig,
+    axis_labels_from_metadata,
+    index_tuple_to_slice_annotations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -650,8 +655,18 @@ class StackProcessor(Configurable):
         )
         iterator = ArrayIterator(stack, self.config.iterator_config)
         n_iterations = len(iterator)
+        axis_labels = axis_labels_from_metadata(metadata)
         if n_iterations == 1:
-            results = self._process_slice(stack, *args, metadata=metadata, **kwargs)
+            slice_annotations = index_tuple_to_slice_annotations(
+                iterator.indices[0], axis_labels
+            )
+            results = self._process_slice(
+                stack,
+                *args,
+                metadata=metadata,
+                slice_annotations=slice_annotations,
+                **kwargs,
+            )
         else:
             logger.info(
                 f"Using Parallel with n_jobs={workers} for {n_iterations} iterations"
@@ -663,9 +678,15 @@ class StackProcessor(Configurable):
                 prefer=self.config.preferred_backend,
             )(
                 delayed(self._process_slice)(
-                    stack_slice, *args, metadata=metadata, **kwargs
+                    stack[idx_tuple],
+                    *args,
+                    metadata=metadata,
+                    slice_annotations=index_tuple_to_slice_annotations(
+                        idx_tuple, axis_labels
+                    ),
+                    **kwargs,
                 )
-                for stack_slice in iterator
+                for idx_tuple in iterator.indices
             )
             results = self._reshape_slice_results(
                 results,
@@ -942,7 +963,15 @@ class StackProcessor(Configurable):
                 logger.info(f"Not reshaping results, type(results)={type(results)}")
             #    results = [list(item) for item in results]
         elif self.config.output_type == "dataframe":
-            results = pd.concat(results, ignore_index=True).set_index("label")
+            frames = []
+            for frame in results:
+                if hasattr(frame, "index") and frame.index.name == "label":
+                    frames.append(frame.reset_index())
+                else:
+                    frames.append(frame)
+            results = pd.concat(frames, ignore_index=True)
+            if "label" in results.columns:
+                results = results.set_index("label")
         return results
 
 

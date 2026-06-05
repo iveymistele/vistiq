@@ -122,14 +122,16 @@ class RegionFilterConfig(Configuration):
             self.filters = []
             return self
 
-        allowed = RegionAnalyzer.allowed_properties()
         for filter in self.filters:
-            if filter.config.attribute is None:
+            attribute = filter.config.attribute
+            if attribute is None:
                 continue
-            if filter.config.attribute not in allowed:
+            if not RegionAnalyzer.is_allowed_filter_attribute(attribute):
                 raise ValueError(
-                    f"Filter attribute '{filter.config.attribute}' is not allowed. "
-                    f"Allowed attributes are: {allowed}"
+                    f"Filter attribute '{attribute}' is not allowed. "
+                    f"Use a region property from {RegionAnalyzer.allowed_properties()} "
+                    f"or a mapped axis column (e.g. 'cross_sectional_area-xy', "
+                    f"'centroid-y', 'bbox-start-z')."
                 )
         return self
 
@@ -285,7 +287,9 @@ class RegionFilter(Configurable[RegionFilterConfig]):
         removed_labels = set()  # Use set for O(1) lookup by label
         for region in regions:
             for filter in self.config.filters:
-                value = getattr(region, filter.config.attribute)
+                value = RegionAnalyzer.get_region_attribute(
+                    region, filter.config.attribute
+                )
                 if not filter.accept(value):
                     # logger.debug(
                     #    f"filter {filter.config.attribute} value={value} not in range for region {region.label}"

@@ -187,6 +187,10 @@ def group_bboxes(bboxes, divisor=1, threshold=0.5):
             if item in g:
                 return True
         return False
+
+    bboxes = np.asarray(bboxes)
+    if bboxes.size == 0 or bboxes.shape[0] == 0:
+        return []
     
     xyxy = np.mod(bboxes, divisor)
     #print (xyxy[:7])
@@ -216,6 +220,29 @@ def label_grouped_mask(mask:np.ndarray, groups:list[np.ndarray], threshold:float
         labels.append(label_array)
     labels = np.sum(np.array(labels), axis=0).astype(dtype)
     return labels
+
+
+def region_bbox_array(results: pd.DataFrame, spatial_ndim: int) -> np.ndarray:
+    """Extract bbox rows from a RegionAnalyzer dataframe for :func:`group_bboxes`."""
+    if results.empty:
+        return np.empty((0, spatial_ndim * 2))
+
+    if spatial_ndim == 3:
+        cols = ["bbox-2", "bbox-1", "bbox-0", "bbox-5", "bbox-4", "bbox-3"]
+        offset = np.array((0, 0, 0, 1, 1, 1))
+    elif spatial_ndim == 2:
+        cols = ["bbox-1", "bbox-0", "bbox-3", "bbox-2"]
+        offset = np.array((0, 0, 1, 1))
+    else:
+        raise ValueError(f"Unsupported spatial ndim for bbox grouping: {spatial_ndim}")
+
+    missing = [c for c in cols if c not in results.columns]
+    if missing:
+        raise KeyError(
+            f"Missing bbox columns {missing} in region analysis results; "
+            f"available columns: {list(results.columns)}"
+        )
+    return results[cols].to_numpy() - offset
 
 
 class SegmenterConfig(StackProcessorConfig):
@@ -1697,14 +1724,30 @@ class TiledSegmentationFlow(SegmentationFlow):
         t_results = bbox_analyzer.run(t_labels, *args, metadata=t_metadata, **kwargs)
 
         # group regions
-        divisor = t_labels.shape[-1]//self.config.tile_factor[-1]
-        logger.info(f"Divisor: {divisor}, t_labels.shape: {t_labels.shape}, self.config.tile_factor: {self.config.tile_factor}")
-        if stack.ndim == 3:
-            t_groups = group_bboxes(t_results[["bbox-2", "bbox-1", "bbox-0", "bbox-5", "bbox-4", "bbox-3"]].to_numpy()-np.array((0,0,0,1,1,1)), divisor=divisor, threshold=self.config.iou_threshold)
-        elif stack.ndim == 2:
-            t_groups = group_bboxes(t_results[["bbox-1", "bbox-0", "bbox-3", "bbox-2"]].to_numpy()-np.array((0,0,1,1)), divisor=divisor, threshold=self.config.iou_threshold)
-        else:
-            raise ValueError(f"Unsupported number of dimensions: {stack.ndim}")
+        divisor = t_labels.shape[-1] // self.config.tile_factor[-1]
+        spatial_ndim = t_labels.ndim if t_labels.ndim in (2, 3) else stack.ndim
+        logger.info(
+            f"Divisor: {divisor}, t_labels.shape: {t_labels.shape}, "
+            f"spatial_ndim: {spatial_ndim}, tile_factor: {self.config.tile_factor}, "
+            f"n_regions: {len(t_results)}"
+        )
+        bboxes = region_bbox_array(t_results, spatial_ndim)
+        if bboxes.shape[0] == 0:
+            logger.warning(
+                "TiledSegmentationFlow: no regions detected in tiled analysis; "
+                "returning zero labels"
+            )
+            return (
+                np.zeros(stack.shape, dtype=np.uint16),
+                t_labels,
+                np.empty((0, *t_labels.shape), dtype=bool),
+                np.empty((0, *t_labels.shape), dtype=bool),
+                np.zeros(t_labels.shape[-2:], dtype=bool),
+            )
+
+        t_groups = group_bboxes(
+            bboxes, divisor=divisor, threshold=self.config.iou_threshold
+        )
 
         # convert labels to stack of masks: the stack will have shape (len(t_groups), *t_labels.shape)
         t_masks = labels_to_masks(t_labels)

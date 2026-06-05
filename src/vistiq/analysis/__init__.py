@@ -1,3 +1,5 @@
+from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
+
 from .coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
@@ -7,6 +9,12 @@ from .coincidence import (
     mask_iou_batch_3d,
     mask_iou_batch_3d_torch,
 )
+from .distance import (
+    DistanceAnalyzer,
+    DistanceAnalyzerConfig,
+    MatrixAnalyzer,
+    MatrixAnalyzerConfig,
+)
 from .enrichment import (
     GridDensityFeaturesConfig,
     NeighborFeaturesConfig,
@@ -15,10 +23,19 @@ from .enrichment import (
     add_grid_density_features,
     add_neighbor_features,
 )
+from .workflow import AnalysisWorkflow, AnalysisWorkflowConfig
 
 __all__ = [
+    "AnalysisWorkflow",
+    "AnalysisWorkflowConfig",
     "CoincidenceDetector",
     "CoincidenceDetectorConfig",
+    "DistanceAnalyzer",
+    "DistanceAnalyzerConfig",
+    "MatrixAnalyzer",
+    "MatrixAnalyzerConfig",
+    "RegionAnalyzer",
+    "RegionAnalyzerConfig",
     "box_iou_batch_3d",
     "labels_iou_batch_3d",
     "labels_iou_batch_3d_torch",

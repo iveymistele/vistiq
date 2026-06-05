@@ -7,7 +7,9 @@ from vistiq.utils import (
     ArrayIteratorConfig,
     ArrayIterator,
     array_content_digest,
+    axis_labels_from_metadata,
     create_unique_folder,
+    index_tuple_to_slice_annotations,
     masks_to_labels,
     labels_to_mask,
 )
@@ -115,6 +117,38 @@ class TestArrayIterator:
         for _ in iterator2:
             count += 1
         assert count == sample_3d_array.shape[0]
+
+
+class TestSliceAnnotations:
+    """Tests for slice annotation helpers."""
+
+    def test_index_tuple_to_slice_annotations_czyx(self):
+        """CZYX stack with slice_def=(-2,-1) maps C and Z indices."""
+        metadata = {"axes": list("CZYX")}
+        labels = np.zeros((3, 2, 4, 4), dtype=np.int32)
+        config = ArrayIteratorConfig(slice_def=(-2, -1))
+        iterator = ArrayIterator(labels, config)
+
+        expected = [
+            {"c": 0, "z": 0},
+            {"c": 0, "z": 1},
+            {"c": 1, "z": 0},
+            {"c": 1, "z": 1},
+            {"c": 2, "z": 0},
+            {"c": 2, "z": 1},
+        ]
+        axes = axis_labels_from_metadata(metadata)
+        actual = [
+            index_tuple_to_slice_annotations(idx, axes) for idx in iterator.indices
+        ]
+        assert actual == expected
+
+    def test_index_tuple_empty_when_all_axes_kept(self):
+        """slice_def=() yields no iterated-axis annotations."""
+        labels = np.zeros((3, 2, 4, 4), dtype=np.int32)
+        iterator = ArrayIterator(labels, ArrayIteratorConfig(slice_def=()))
+        axes = axis_labels_from_metadata({"axes": list("CZYX")})
+        assert index_tuple_to_slice_annotations(iterator.indices[0], axes) == {}
 
 
 class TestCreateUniqueFolder:

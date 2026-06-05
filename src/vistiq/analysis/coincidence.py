@@ -19,6 +19,8 @@ from vistiq.core import (
 from vistiq.utils import (
     ArrayIterator,
     ArrayIteratorConfig,
+    _normalize_stack_names,
+    _torch_imports,
     check_device,
     create_unique_folder,
 )
@@ -30,37 +32,17 @@ logger = logging.getLogger(__name__)
 _LABELS_IOU_DENSE_PAIR_FRACTION = 1.01
 
 
-def _normalize_stack_name(name: Any) -> str:
-    """Coerce metadata channel name(s) to a hashable string label."""
-    if isinstance(name, (list, tuple)):
-        if len(name) == 0:
-            return "stack"
-        if len(name) == 1:
-            return str(name[0])
-        return "-".join(str(n) for n in name)
-    return str(name)
-
-
-def _normalize_stack_names(
-    stack_names: Optional[Union[Tuple[Any, ...], List[Any]]],
-) -> Tuple[str, str]:
-    """Return a pair of string stack names for result dict keys."""
-    if stack_names is None or len(stack_names) != 2:
-        return ("stack_1", "stack_2")
-    return (
-        _normalize_stack_name(stack_names[0]),
-        _normalize_stack_name(stack_names[1]),
-    )
-
-
 def _label_ids_and_boxes(
     labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return label ids and axis-aligned boxes ``(x_min, y_min, z_min, x_max, y_max, z_max)``."""
     labels = np.asarray(labels)
-    table = regionprops_table(labels, properties=("label", "bbox"))
+
+    ra = RegionAnalyzer(RegionAnalyzerConfig(properties=["object_id","label", "bbox"], output_type="dataframe", iterator_config=ArrayIteratorConfig(slice_def=())))
+    table = ra.run(labels)
+
     if len(table) == 0:
-        return np.array([], dtype=np.int64), np.empty((0, 6), dtype=np.float32)
+        return np.array([], dtype=np.int64), np.empty((0, 2*labels.ndim), dtype=np.float32)
     ids = table["label"].astype(np.int64, copy=False)
     if labels.ndim == 3:
         boxes = np.column_stack(
@@ -250,18 +232,6 @@ def mask_iou_batch_3d(
             )
         )
     return np.vstack(ious).astype(np.float32, copy=False)
-
-
-def _torch_imports() -> Any:
-    """Return the ``torch`` module or raise if PyTorch is unavailable."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise ImportError(
-            "PyTorch is required for torch overlap functions. "
-            "Install torch or use mask_iou_batch_3d / labels_iou_batch_3d."
-        ) from exc
-    return torch
 
 
 def _resolve_torch_device(

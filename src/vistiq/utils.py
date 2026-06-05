@@ -13,6 +13,7 @@ from typing import (
     Dict,
     Pattern,
     Any,
+    Sequence,
 )
 from collections import defaultdict
 
@@ -289,6 +290,45 @@ class ArrayIterator:
     def __len__(self) -> int:
         """Return the number of iterations."""
         return len(self.indices)
+
+
+def axis_labels_from_metadata(
+    metadata: Optional[dict[str, Any]],
+) -> Optional[list[str]]:
+    """Return axis labels from stack metadata (``axes``, ``axis``, or ``dim_order``)."""
+    if metadata is None:
+        return None
+    axes = metadata.get("axes") or metadata.get("axis") or metadata.get("dim_order")
+    if axes is None:
+        return None
+    return list(axes) if isinstance(axes, str) else list(axes)
+
+
+def index_tuple_to_slice_annotations(
+    index_tuple: tuple[Any, ...],
+    axes: Optional[Union[str, Sequence[str]]] = None,
+) -> dict[str, int]:
+    """Map integer indices in an ArrayIterator index tuple to axis labels.
+
+    Axes that are sliced with ``slice(None)`` (kept by ``slice_def``) are omitted.
+    Keys use lowercase axis labels (e.g. ``c``, ``z`` from ``CZYX`` metadata).
+    """
+    axis_labels: Optional[list[str]] = None
+    if axes is not None:
+        axis_labels = list(axes) if isinstance(axes, str) else list(axes)
+
+    annotations: dict[str, int] = {}
+    for i, idx in enumerate(index_tuple):
+        if isinstance(idx, slice):
+            continue
+        if not isinstance(idx, (int, np.integer)):
+            continue
+        if axis_labels is not None and i < len(axis_labels):
+            label = str(axis_labels[i]).lower()
+        else:
+            label = f"axis_{i}"
+        annotations[label] = int(idx)
+    return annotations
 
 
 def create_unique_folder(base_path=".", prefix="", suffix="", exist_ok=True):
@@ -641,6 +681,44 @@ def load_mp4(
         to_grayscale,
     )
     return video_array
+
+
+def _normalize_stack_name(name: Any) -> str:
+    """Coerce metadata channel name(s) to a hashable string label."""
+    if isinstance(name, (list, tuple)):
+        if len(name) == 0:
+            return "stack"
+        if len(name) == 1:
+            return str(name[0])
+        return "-".join(str(n) for n in name)
+    return str(name)
+
+
+def _normalize_stack_names(
+    stack_names: Optional[Union[Tuple[Any, ...], List[Any]]],
+) -> Tuple[str, str]:
+    """Return a pair of string stack names for result dict keys."""
+    if stack_names is None or len(stack_names) != 2:
+        return ("stack_1", "stack_2")
+    return (
+        _normalize_stack_name(stack_names[0]),
+        _normalize_stack_name(stack_names[1]),
+    )
+
+
+def _torch_imports(raise_on_error: bool = False) -> Any:
+    """Return the ``torch`` module or raise if PyTorch is unavailable."""
+    try:
+        import torch
+    except ImportError as exc:
+        if raise_on_error:
+            raise ImportError(
+                "PyTorch is not installed. No fallback functions available."
+                ) from exc
+        else:
+            logger.warning("PyTorch is not available, trying to use fallback functions")
+            return None
+    return torch
 
 
 def available_accelerator_devices() -> dict[str, list[dict[str, Any]]]:
