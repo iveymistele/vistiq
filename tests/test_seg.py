@@ -585,7 +585,20 @@ class TestRegionAnalyzer:
         assert isinstance(accepted, list)
         assert isinstance(removed, list)
 
-    def test_process_slice_list_output_includes_mandatory_ids(self, sample_labels_2d):
+    def test_region_filter_bare_cross_sectional_area_on_3d_raises(
+        self, sample_labels_3d
+    ):
+        """Bare cross_sectional_area on 3D+ raises; use a plane-specific name."""
+        config = RegionAnalyzerConfig(
+            output_type="list",
+            properties=["label", "cross_sectional_area"],
+            iterator_config=ArrayIteratorConfig(slice_def=(-3, -2, -1)),
+        )
+        regions = RegionAnalyzer(config)._process_slice(
+            sample_labels_3d, metadata={"axes": list("ZYX")}
+        )
+        with pytest.raises(AttributeError, match="cross_sectional_area-xy"):
+            RegionAnalyzer.get_region_attribute(regions[0], "cross_sectional_area")
         """List output includes mandatory ids on each region."""
         config = RegionAnalyzerConfig(output_type="list", properties=["area"])
         analyzer = RegionAnalyzer(config)

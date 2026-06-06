@@ -23,9 +23,12 @@ from .enrichment import (
     add_grid_density_features,
     add_neighbor_features,
 )
-from .workflow import AnalysisWorkflow, AnalysisWorkflowConfig
+from .workflow import AnalysisFlow, AnalysisFlowConfig
+
 
 __all__ = [
+    "AnalysisFlow",
+    "AnalysisFlowConfig",
     "AnalysisWorkflow",
     "AnalysisWorkflowConfig",
     "CoincidenceDetector",

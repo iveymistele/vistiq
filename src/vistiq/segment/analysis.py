@@ -290,7 +290,12 @@ class RegionAnalyzer(StackProcessor):
 
     @classmethod
     def _scalar_from_base_property(cls, name: str, value: Any) -> Any:
-        """Return a scalar when *name* is an unmapped vector extra property."""
+        """Return a scalar when *name* is an unmapped vector extra property.
+
+        Raises:
+            AttributeError: If *name* is ``cross_sectional_area`` but *value* is
+                a multi-component tuple (use e.g. ``cross_sectional_area-xy``).
+        """
         if not isinstance(value, (tuple, list, np.ndarray)):
             return value
         if name == "aspect_ratio":
@@ -357,7 +362,10 @@ class RegionAnalyzer(StackProcessor):
             AttributeError: If the property or component cannot be resolved.
         """
         if name in region.__dict__:
-            return region.__dict__[name]
+            val = region.__dict__[name]
+            if name == cls.base_property_name(name):
+                return cls._scalar_from_base_property(name, val)
+            return val
 
         base = cls.base_property_name(name)
         if name != base:
@@ -683,10 +691,16 @@ class RegionAnalyzer(StackProcessor):
 
         for region in results:
             for prop in ("area", "volume", "cross_sectional_area"):
-                if hasattr(region, prop):
-                    region.__dict__[prop] = cls._positive_extent_value(
-                        getattr(region, prop)
-                    )
+                if not hasattr(region, prop):
+                    continue
+                val = getattr(region, prop)
+                if isinstance(val, (tuple, list, np.ndarray)):
+                    if prop == "cross_sectional_area":
+                        continue
+                    val = cls._positive_extent_value(val)
+                else:
+                    val = cls._positive_extent_value(val)
+                region.__dict__[prop] = val
             for key, val in list(region.__dict__.items()):
                 if key.startswith("cross_sectional_area-"):
                     region.__dict__[key] = cls._positive_extent_value(val)

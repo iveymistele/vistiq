@@ -24,6 +24,7 @@ from vistiq.utils import (
     check_device,
     create_unique_folder,
 )
+from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.workflow import Workflow
 
 logger = logging.getLogger(__name__)
@@ -35,15 +36,34 @@ _LABELS_IOU_DENSE_PAIR_FRACTION = 1.01
 def _label_ids_and_boxes(
     labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return label ids and axis-aligned boxes ``(x_min, y_min, z_min, x_max, y_max, z_max)``."""
+    """Return segmentation label ids and axis-aligned boxes.
+
+    Uses integer ``label`` values from :class:`RegionAnalyzer` (not ``object_id``,
+    which is a hex string). Boxes are ``(x_min, y_min, z_min, x_max, y_max, z_max)``.
+    """
     labels = np.asarray(labels)
 
-    ra = RegionAnalyzer(RegionAnalyzerConfig(properties=["object_id","label", "bbox"], output_type="dataframe", iterator_config=ArrayIteratorConfig(slice_def=())))
+    ra = RegionAnalyzer(
+        RegionAnalyzerConfig(
+            properties=["label", "bbox"],
+            output_type="dataframe",
+            iterator_config=ArrayIteratorConfig(slice_def=()),
+        )
+    )
     table = ra.run(labels)
 
     if len(table) == 0:
-        return np.array([], dtype=np.int64), np.empty((0, 2*labels.ndim), dtype=np.float32)
-    ids = table["label"].astype(np.int64, copy=False)
+        return np.array([], dtype=np.int64), np.empty(
+            (0, 2 * labels.ndim), dtype=np.float32
+        )
+    if "label" in table.columns:
+        label_ids = table["label"].astype(np.int64, copy=False)
+    elif table.index.name == "label":
+        label_ids = table.index.astype(np.int64, copy=False)
+    else:
+        raise ValueError(
+            "Label DataFrame must have a 'label' column or index named 'label'"
+        )
     if labels.ndim == 3:
         boxes = np.column_stack(
             (
@@ -57,7 +77,7 @@ def _label_ids_and_boxes(
         )
     elif labels.ndim == 2:
         # skimage 2D bbox: (min_row, min_col, max_row, max_col) -> x, y, z slab
-        n = len(ids)
+        n = len(label_ids)
         boxes = np.column_stack(
             (
                 table["bbox-1"],
@@ -72,7 +92,7 @@ def _label_ids_and_boxes(
         raise ValueError(
             f"Label arrays must be 2D or 3D for region bounding boxes; got {labels.ndim}D"
         )
-    return ids, boxes.astype(np.float32, copy=False)
+    return label_ids, boxes.astype(np.float32, copy=False)
 
 
 def _positive_label_ids(labels: np.ndarray) -> np.ndarray:
