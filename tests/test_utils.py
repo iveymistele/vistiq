@@ -3,11 +3,13 @@ import os
 import tempfile
 import numpy as np
 import pytest
-from pathlib import Path
 from vistiq.utils import (
     ArrayIteratorConfig,
     ArrayIterator,
+    array_content_digest,
+    axis_labels_from_metadata,
     create_unique_folder,
+    index_tuple_to_slice_annotations,
     masks_to_labels,
     labels_to_mask,
 )
@@ -117,6 +119,38 @@ class TestArrayIterator:
         assert count == sample_3d_array.shape[0]
 
 
+class TestSliceAnnotations:
+    """Tests for slice annotation helpers."""
+
+    def test_index_tuple_to_slice_annotations_czyx(self):
+        """CZYX stack with slice_def=(-2,-1) maps C and Z indices."""
+        metadata = {"axes": list("CZYX")}
+        labels = np.zeros((3, 2, 4, 4), dtype=np.int32)
+        config = ArrayIteratorConfig(slice_def=(-2, -1))
+        iterator = ArrayIterator(labels, config)
+
+        expected = [
+            {"c": 0, "z": 0},
+            {"c": 0, "z": 1},
+            {"c": 1, "z": 0},
+            {"c": 1, "z": 1},
+            {"c": 2, "z": 0},
+            {"c": 2, "z": 1},
+        ]
+        axes = axis_labels_from_metadata(metadata)
+        actual = [
+            index_tuple_to_slice_annotations(idx, axes) for idx in iterator.indices
+        ]
+        assert actual == expected
+
+    def test_index_tuple_empty_when_all_axes_kept(self):
+        """slice_def=() yields no iterated-axis annotations."""
+        labels = np.zeros((3, 2, 4, 4), dtype=np.int32)
+        iterator = ArrayIterator(labels, ArrayIteratorConfig(slice_def=()))
+        axes = axis_labels_from_metadata({"axes": list("CZYX")})
+        assert index_tuple_to_slice_annotations(iterator.indices[0], axes) == {}
+
+
 class TestCreateUniqueFolder:
     """Tests for create_unique_folder function."""
 
@@ -212,4 +246,28 @@ class TestLabelsToMask:
         assert len(masks) == 2
         assert masks[0].shape == labels.shape
         assert masks[1].shape == labels.shape
+
+
+class TestArrayContentDigest:
+    """Tests for array_content_digest."""
+
+    def test_same_array_same_digest(self):
+        a = np.arange(12, dtype=np.float32).reshape(3, 4)
+        b = a.copy()
+        assert array_content_digest(a) == array_content_digest(b)
+
+    def test_fortran_and_c_order_match(self):
+        a = np.arange(12, dtype=np.float32).reshape(3, 4)
+        f = np.asfortranarray(a.copy())
+        assert array_content_digest(a) == array_content_digest(f)
+
+    def test_different_shape_differs(self):
+        a = np.ones((3, 4), dtype=np.uint8)
+        b = np.ones((4, 3), dtype=np.uint8)
+        assert array_content_digest(a) != array_content_digest(b)
+
+    def test_different_dtype_differs(self):
+        a = np.ones((2, 2), dtype=np.uint8)
+        b = np.ones((2, 2), dtype=np.uint16)
+        assert array_content_digest(a) != array_content_digest(b)
 

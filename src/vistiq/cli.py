@@ -1,15 +1,14 @@
 """CLI configuration models for vistiq command-line interface."""
 
-import sys
 import logging
 import json
 import numpy as np
 import os
 from pathlib import Path
-from typing import Optional, Literal, List, Union, Any
+from typing import Optional, Literal, List, Any
 from pydantic import BaseModel, Field, field_validator
 import typer
-from typer import Option, Argument, Context
+from typer import Option, Context
 from prefect import flow
 from prefect.artifacts import create_progress_artifact, update_progress_artifact
 
@@ -21,7 +20,7 @@ except ImportError:
     OME_TIFF_AVAILABLE = False
     OmeTiffWriter = None
 
-from .core import StackProcessorConfig, cli_config, Configuration, Configurable
+from .core import StackProcessorConfig, Configuration, Configurable
 from .io import (
     DataLoaderConfig,
     ImageLoaderConfig,
@@ -41,12 +40,11 @@ from .train import (
     MicroSAMTrainer,
 )
 from .workflow_builder import (
-    ConfigArgumentBuilder,
     WorkflowBuilder,
     get_registry,
     auto_register_configurables,
 )
-from .utils import load_image, get_scenes
+from .utils import get_scenes
 
 # from .app import configure_logger
 

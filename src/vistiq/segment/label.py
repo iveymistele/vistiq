@@ -1,29 +1,52 @@
 import logging
+import os
+import math
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import supervision as sv
+
+from os import PathLike
 from micro_sam.automatic_segmentation import (
     automatic_instance_segmentation,
     get_predictor_and_segmenter,
 )
+from micro_sam.multi_dimensional_segmentation import merge_instance_segmentation_3d
+
 from prefect import task, flow
 from pydantic import field_validator, model_validator, PositiveInt
 from skimage.measure import label as sk_label
 
 from vistiq.core import (
-    Configuration,
+    Configurable,
     StackProcessor,
     StackProcessorConfig,
+    Tiler,
+    TilerConfig,
+    Untiler,
+    UntilerConfig,
+    generate_name,
+    labels_to_masks,
 )
-from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folder
-from vistiq.workflow import Workflow
+from vistiq.utils import (
+    ArrayIterator,
+    ArrayIteratorConfig,
+    array_content_digest,
+    check_device,
+    set_fractional_memory,
+)
+from vistiq.preprocess import (
+    Resize, 
+    ResizeConfig, 
+)
+
+from vistiq.workflow import Workflow, WorkflowConfig
 
 from vistiq.segment._debug import debug_mask_labels
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.segment.postprocess import (
     BinaryProcessor,
-    BinaryProcessorConfig,
     dilate_regions,
 )
 from vistiq.segment.select import (
@@ -38,6 +61,387 @@ from vistiq.segment.threshold import (
 
 logger = logging.getLogger(__name__)
 
+def box_iou_batch_3d(
+    boxes_true: np.typing.NDArray[np.number],
+    boxes_detection: np.typing.NDArray[np.number],
+    overlap_metric: Literal["IOU", "IOS"] = "IOU"
+) -> np.ndarray[np.float32]:
+    """
+    Adapted for 3d from https://github.com/roboflow/supervision/blob/develop/src/supervision/detection/utils/iou_and_nms.py
+    
+    Compute pairwise overlap scores between batches of bounding boxes.
+
+    Supports standard IOU (intersection-over-union) and IOS
+    (intersection-over-smaller-area) metrics for all `boxes_true` and
+    `boxes_detection` pairs. Returns a matrix of overlap values in range
+    `[0, 1]`, matching each box from the first batch to each from the second.
+
+    Args:
+        boxes_true: Array of reference boxes in
+            shape `(N, 4)` as `(x_min, y_min, z_min, x_max, y_max, z_max)`.
+        boxes_detection: Array of detected boxes in
+            shape `(M, 4)` as `(x_min, y_min, z_min, x_max, y_max, z_min)`.
+        overlap_metric: Overlap type.
+            Use `OverlapMetric.IOU` for intersection-over-union,
+            `OverlapMetric.IOS` for intersection-over-smaller-area.
+            Defaults to `OverlapMetric.IOU`.
+
+    Returns:
+        Overlap matrix of shape `(N, M)`, where entry
+            `[i, j]` is the overlap between `boxes_true[i]` and
+            `boxes_detection[j]`.
+
+    Raises:
+        ValueError: If `overlap_metric` is not IOU or IOS.
+
+    Examples:
+        ```pycon
+        >>> import numpy as np
+        >>> import supervision as sv
+        >>> boxes_true = np.array([
+        ...     [100, 100, 200, 200],
+        ...     [300, 300, 400, 400]
+        ... ])
+        >>> boxes_detection = np.array([
+        ...     [150, 150, 250, 250],
+        ...     [320, 320, 420, 420]
+        ... ])
+        >>> sv.box_iou_batch_3d(
+        ...     boxes_true, boxes_detection, overlap_metric=sv.OverlapMetric.IOU
+        ... )
+        array([[0.14285..., 0.        ],
+               [0.        , 0.47058...]], dtype=float32)
+        >>> sv.box_iou_batch(
+        ...     boxes_true, boxes_detection, overlap_metric=sv.OverlapMetric.IOS
+        ... )
+        array([[0.25, 0.  ],
+               [0.  , 0.64]], dtype=float32)
+
+        ```
+    """
+    #overlap_metric = OverlapMetric.from_value(overlap_metric)
+    x_min_true, y_min_true, z_min_true, x_max_true, y_max_true, z_max_true = boxes_true.T
+    x_min_det, y_min_det, z_min_det, x_max_det, y_max_det, z_max_det = boxes_detection.T
+    count_true, count_det = boxes_true.shape[0], boxes_detection.shape[0]
+
+    if count_true == 0 or count_det == 0:
+        return cast(
+            np.typing.NDArray[np.float32], np.empty((count_true, count_det), dtype=np.float32)
+        )
+
+    x_min_inter = np.empty((count_true, count_det), dtype=np.float32)
+    x_max_inter = np.empty_like(x_min_inter)
+    y_min_inter = np.empty_like(x_min_inter)
+    y_max_inter = np.empty_like(x_min_inter)
+    z_min_inter = np.empty_like(x_min_inter)
+    z_max_inter = np.empty_like(x_min_inter)
+
+    np.maximum(x_min_true[:, None], x_min_det[None, :], out=x_min_inter)
+    np.minimum(x_max_true[:, None], x_max_det[None, :], out=x_max_inter)
+    np.maximum(y_min_true[:, None], y_min_det[None, :], out=y_min_inter)
+    np.minimum(y_max_true[:, None], y_max_det[None, :], out=y_max_inter)
+    np.maximum(z_min_true[:, None], z_min_det[None, :], out=z_min_inter)
+    np.minimum(z_max_true[:, None], z_max_det[None, :], out=z_max_inter)
+
+    # we reuse x_max_inter and y_max_inter to store inter_w, inter_h and inter_d
+    np.subtract(x_max_inter, x_min_inter, out=x_max_inter)  # inter_w
+    np.subtract(y_max_inter, y_min_inter, out=y_max_inter)  # inter_h
+    np.subtract(z_max_inter, z_min_inter, out=z_max_inter)  # inter_d
+    np.clip(x_max_inter, 0.0, None, out=x_max_inter)
+    np.clip(y_max_inter, 0.0, None, out=y_max_inter)
+    np.clip(z_max_inter, 0.0, None, out=z_max_inter)
+
+    area_inter = x_max_inter * y_max_inter * z_max_inter # inter_w * inter_h * inter_d
+
+    area_true = (x_max_true - x_min_true) * (y_max_true - y_min_true) * (z_max_true - z_min_true)
+    area_det = (x_max_det - x_min_det) * (y_max_det - y_min_det)  * (z_max_det - z_min_det)
+
+    if overlap_metric == "IOU":
+        area_norm = area_true[:, None] + area_det[None, :] - area_inter
+    elif overlap_metric == "IOS":
+        area_norm = np.minimum(area_true[:, None], area_det[None, :])
+    else:
+        raise ValueError(
+            f"overlap_metric {overlap_metric} is not supported, "
+            "only 'IOU' and 'IOS' are supported"
+        )
+
+    out: np.ndarray[np.float32] = np.zeros_like(area_inter, dtype=np.float32)
+    np.divide(area_inter, area_norm, out=out, where=area_norm > 0)
+    return out
+
+
+def labels_to_masks(labels):
+    label_values = (v for v in np.unique(labels) if v > 0)
+    masks = []
+    for value in label_values:
+        mask = labels == value
+        masks.append(mask)
+    return np.array(masks)
+
+
+def group_bboxes(bboxes, divisor=1, threshold=0.5):
+    
+    def in_groups(item, groups):
+        for g in groups:
+            if item in g:
+                return True
+        return False
+
+    bboxes = np.asarray(bboxes)
+    if bboxes.size == 0 or bboxes.shape[0] == 0:
+        return []
+    
+    xyxy = np.mod(bboxes, divisor)
+    #print (xyxy[:7])
+    if len(bboxes[0]) == 4:
+        iou_matrix = sv.box_iou_batch(xyxy, xyxy, overlap_metric=sv.OverlapMetric.IOU)
+    elif len(bboxes[0]) == 6:
+        iou_matrix = box_iou_batch_3d(xyxy, xyxy, overlap_metric="IOU")
+    #print (iou_matrix)
+    iou_matrix = np.triu(iou_matrix, k=1)
+    pairs = np.argwhere(iou_matrix > threshold)
+    
+    groups = []
+    for i, pair in enumerate(pairs):
+        p0 = pair[0]
+        #print (i, p0, p1, iou_matrix[p0, p1])
+        if not in_groups(p0, groups):
+            pairs_with_p0 = np.unique(np.array([p for p in pairs if p[0] == p0]).flatten())
+            logger.info(f"Creating new group with {pairs_with_p0}")
+            groups.append(pairs_with_p0)
+    return groups
+
+
+def label_grouped_mask(mask:np.ndarray, groups:list[np.ndarray], threshold:float=0.5, dtype:str="uint64"):
+    labels = []
+    for label_value, g in enumerate(groups, 1):
+        label_array = (mask[g].mean(axis=0)>threshold) * label_value
+        labels.append(label_array)
+    labels = np.sum(np.array(labels), axis=0).astype(dtype)
+    return labels
+
+
+def region_bbox_array(results: pd.DataFrame, spatial_ndim: int) -> np.ndarray:
+    """Extract bbox rows from a RegionAnalyzer dataframe for :func:`group_bboxes`."""
+    if results.empty:
+        return np.empty((0, spatial_ndim * 2))
+
+    if spatial_ndim == 3:
+        cols = ["bbox-2", "bbox-1", "bbox-0", "bbox-5", "bbox-4", "bbox-3"]
+        offset = np.array((0, 0, 0, 1, 1, 1))
+    elif spatial_ndim == 2:
+        cols = ["bbox-1", "bbox-0", "bbox-3", "bbox-2"]
+        offset = np.array((0, 0, 1, 1))
+    else:
+        raise ValueError(f"Unsupported spatial ndim for bbox grouping: {spatial_ndim}")
+
+    missing = [c for c in cols if c not in results.columns]
+    if missing:
+        raise KeyError(
+            f"Missing bbox columns {missing} in region analysis results; "
+            f"available columns: {list(results.columns)}"
+        )
+    return results[cols].to_numpy() - offset
+
+
+class SegmenterConfig(StackProcessorConfig):
+
+    pass
+
+
+class Segmenter(StackProcessor):
+
+    def __init__(self, config: SegmenterConfig):
+        super().__init__(config)
+
+    @task(name="Segmenter.run")
+    def run(
+        self,
+        stack: np.ndarray,
+        *args,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> tuple[Any, Optional[dict[str, Any]]]:
+        labels, metadata = super().run(stack, *args, metadata=metadata, **kwargs)
+        # relabeled, label_mappings = Relabeler.assign_unique_labels(
+        #    labels, self.config.iterator
+        # )
+        iterator_config = self.config.iterator_config
+        relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
+        labels = relabeler.run(labels, metadata=metadata)
+        no_labels = len(np.unique(labels)) - 1  # exclude 0 (background)
+        if np.max(labels) > no_labels:
+            logger.warning(
+                f"Segmenter: found {no_labels}; labels do NOT represent consecutive integers"
+            )
+
+        return labels, metadata
+
+
+class MergerConfig(StackProcessorConfig):
+    """Configuration for label-stack merging.
+
+    Base configuration for :class:`Merger` and its subclasses. Mergers operate on
+    label arrays after slice-wise segmentation, linking instances across the stack
+    axis into a single consistent volume.
+
+    Defaults are tuned for processing a full label volume in one pass rather than
+    iterating over individual slices.
+
+    Attributes:
+        iterator_config: How the input is iterated before merging. Defaults to
+            ``slice_def=()``, so the entire array is passed to the merge step.
+        output_type: Always ``"stack"``; merged labels are returned as a single
+            array.
+        squeeze: Whether to remove singleton dimensions from the output. Defaults
+            to ``False`` to preserve the input rank.
+    """
+
+    iterator_config: ArrayIteratorConfig = ArrayIteratorConfig(
+        slice_def=()
+    )
+    output_type: Literal["stack"] = "stack"
+    squeeze: bool = False
+
+
+class Merger(StackProcessor):
+    """Base class for merging per-slice labels into a consistent volume.
+
+    Validates input dimensionality and delegates to :class:`StackProcessor` for
+    execution. Subclasses (e.g. :class:`MicroSAMMerger`) implement the actual
+    merge logic, typically via a ``merge`` method or ``_process_slice``.
+
+    By default, mergers expect a 3D label array (e.g. ``(Z, Y, X)``) where each
+    slice contains independent instance IDs that should be linked across ``Z``.
+    Arrays with fewer dimensions than required by the iterator are returned
+    unchanged; arrays with unsupported rank are logged and returned unchanged.
+
+    Used as the optional ``merger`` step in :class:`SegmentationFlow`.
+    """
+
+    def __init__(self, config: MergerConfig):
+        """Initialize the merger.
+
+        Args:
+            config: Merger configuration.
+        """
+        super().__init__(config)
+
+    def can_merge(self, ndim: int) -> bool:
+        """Return whether this merger supports the given array rank.
+
+        Args:
+            ndim: Number of dimensions in the label array.
+
+        Returns:
+            ``True`` if the array rank matches :attr:`ndims`.
+        """
+        return ndim == self.ndims
+
+    @property
+    def ndims(self) -> int:
+        """Number of dimensions the merger expects (default: 3)."""
+        return 3
+
+    def merge(self, labels: np.ndarray) -> np.ndarray:
+        raise NotImplementedError("Merger is not implemented")
+
+    def _process_slice(self, labels: np.ndarray, *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        return self.merge(labels)
+
+    @task(name="Merger.run")
+    def run(self, labels: Union[np.ndarray, list[np.ndarray]], *args, metadata: Optional[dict[str, Any]] = None, **kwargs) -> tuple[np.ndarray, Optional[dict[str, Any]]]:
+        """Merge label arrays when the input rank is supported.
+
+        Accepts a single array or a list of arrays (stacked along axis 0). If the
+        input is too low-dimensional for the configured iterator, or its rank does
+        not match :attr:`ndims`, the labels are returned without merging.
+
+        Args:
+            labels: Label array or list of label arrays to merge.
+            metadata: Optional image metadata passed through unchanged.
+            *args: Additional positional arguments for :class:`StackProcessor`.
+            **kwargs: Additional keyword arguments for :class:`StackProcessor`.
+
+        Returns:
+            Tuple of ``(merged_labels, metadata)``.
+        """
+        logger.info(f"Running Merger with config: {self.config}")
+        if isinstance(labels, list):
+            labels = np.stack(labels, axis=0)
+        slice_ndim = ArrayIterator(labels, self.config.iterator_config).slice_ndim
+        if labels.ndim < slice_ndim:
+            logger.info(f"{self.name} handles {self.ndims}-dimensional stacks or slices. The slices produced by the iterator have only {slice_ndim} dimensions. Nothing to merge")
+            return labels, metadata
+        if not self.can_merge(labels.ndim):
+            logger.error(f"Merger: cannot merge {labels.ndim}-dimensional stack")
+            return labels, metadata
+        merged,_  = super().run(labels, *args, metadata=metadata, **kwargs)
+        return merged
+
+
+class MicroSAMMergerConfig(MergerConfig):
+    """Configuration for 3D instance merging with micro_sam.
+
+    Extends :class:`MergerConfig` with parameters passed to
+    ``micro_sam.multi_dimensional_segmentation.merge_instance_segmentation_3d``.
+    Use after per-slice (2D) instance segmentation to link objects across the
+    stack axis into a single 3D label volume.
+
+    Attributes:
+        beta: Trade-off between overlap and distance when matching instances
+            across adjacent slices (higher favors overlap).
+        with_background: Whether label 0 is treated as background during merging.
+        gap_closing: Whether to close small gaps along the stack axis between
+            matched instances.
+        min_z_extent: Minimum number of slices an instance must span to be kept.
+        verbose: Whether to print progress from the underlying merge routine.
+    """
+
+    beta: float = 0.5
+    with_background: bool = True
+    gap_closing: bool = True
+    min_z_extent: int = 10
+    verbose: bool = False
+
+
+class MicroSAMMerger(Merger):
+    """Merge 2D instance label stacks into a consistent 3D label volume.
+
+    Wraps ``merge_instance_segmentation_3d`` from micro_sam. Expects a 3D array
+    of per-slice instance labels (e.g. shape ``(Z, Y, X)``) produced by a
+    segmenter such as :class:`MicroSAMSegmenter`. Instances that correspond to
+    the same object in neighboring slices receive the same label ID.
+
+    Typically used as the ``merger`` step in :class:`SegmentationFlow` after
+    slice-wise segmentation.
+    """
+
+    def __init__(self, config: MicroSAMMergerConfig):
+        """Initialize the merger.
+
+        Args:
+            config: MicroSAM merger configuration.
+        """
+        super().__init__(config)
+
+    def merge(self, labels: np.ndarray) -> np.ndarray:
+        """Link instances across slices using micro_sam.
+
+        Args:
+            labels: 3D label array with per-slice instance IDs.
+
+        Returns:
+            Label array with IDs consistent across the stack axis.
+        """
+        return merge_instance_segmentation_3d(
+            labels,
+            beta=self.config.beta,
+            with_background=self.config.with_background,
+            gap_closing=self.config.gap_closing,
+            min_z_extent=self.config.min_z_extent
+        )
 
 class RelabelerConfig(StackProcessorConfig):
     """Configuration for relabeling operations.
@@ -195,6 +599,9 @@ class Relabeler(StackProcessor):
         if relabeled_labels.shape != original_shape:
             # Reshape if needed (shouldn't happen, but just in case)
             relabeled_labels = relabeled_labels.reshape(original_shape)
+            logger.warning(
+                f"Relabeler: reshaping output to match input shape {original_shape}"
+            )
 
         return relabeled_labels
 
@@ -219,7 +626,7 @@ def remap_labels(
         (old_label, new_label) tuples.
     """
     labels = np.asarray(labels)
-    unique_labels = np.unique(labels, sorted=True)
+    unique_labels = np.unique(labels)  # sorted=True has been deprecated
     do_exclude = exclude is not None and len(exclude) > 0
     logger.debug(f"Unique labels: {unique_labels}, exclude={exclude}")
     if len(unique_labels) == 0:
@@ -537,7 +944,7 @@ class LabelRemover(StackProcessor):
             )
         return result
 
-    @task(name="RegionRemover.run")
+    @task(name="LabelRemover.run")
     def run(
         self,
         labels: np.ndarray,
@@ -585,7 +992,7 @@ class LabelRemover(StackProcessor):
             return results, mapping
         else:
             logger.debug(f"Results after removal: {results}")
-            return results
+            return results, None
 
 
 class LabellerConfig(StackProcessorConfig):
@@ -744,183 +1151,6 @@ class Labeller(StackProcessor):
         return labels, regions
 
 
-class SegmenterConfig(Configuration):
-    """Configuration for segmentation workflow.
-
-    Defines the components and options for the segmentation pipeline.
-
-    Attributes:
-        thresholder: Optional thresholder for converting images to binary masks.
-        binary_processor: Optional processor for binary mask post-processing.
-        labeller: Optional labeller for identifying connected components.
-        region_analyzer: Optional analyzer for extracting region properties.
-        region_filter: Optional filter for removing regions based on criteria.
-        do_labels: Whether to compute and return labels.
-        do_regions: Whether to compute and return region properties.
-    """
-
-    thresholder: Optional[Thresholder] = OtsuThreshold(OtsuThresholdConfig())
-    binary_processor: Optional[BinaryProcessor] = None
-    labeller: Optional[Labeller] = Labeller(
-        LabellerConfig(connectivity=1, region_filter=None, output_type="list")
-    )
-    region_analyzer: Optional[RegionAnalyzer] = (
-        None  # RegionAnalyzer(RegionAnalyzerConfig(output_type="list", properties=RegionAnalyzer.default_properties))
-    )
-    region_filter: Optional[RegionFilter] = None
-    # label_remover: Optional[LabelRemover] = None
-    do_labels: bool = True
-    do_regions: bool = False
-
-    @model_validator(mode="after")
-    @classmethod
-    def check_labeller(cls, data: Any) -> Any:
-        """Validate that labeller is provided if region_filter is specified.
-
-        Args:
-            data: Configuration data to validate.
-
-        Returns:
-            Validated configuration data.
-
-        Raises:
-            ValueError: If region_filter is specified without a labeller.
-        """
-        if "region_filter" in data and "labeller" not in data:
-            raise ValueError(
-                "A labeller must be provided if a region filter is specified"
-            )
-        return data
-
-
-class Segmenter(Workflow):
-    """Segmentation workflow that combines thresholding, labeling, and region analysis.
-
-    Performs a complete segmentation pipeline: thresholding -> binary processing ->
-    labeling -> region analysis -> filtering.
-    """
-
-    def __init__(self, config: SegmenterConfig = None):
-        """Initialize the segmenter.
-
-        Args:
-            config: Segmenter configuration.
-        """
-        super().__init__(config)
-        self.config.do_regions = self.config.do_regions or (
-            self.config.region_analyzer is not None
-            or self.config.region_filter is not None
-        )
-        self.config.do_labels = self.config.do_regions or (
-            self.config.do_labels and self.config.labeller is not None
-        )
-        if self.config.do_labels and self.config.labeller is None:
-            logger.info(
-                "Labeller not provided, using default Labeller with connectivity=1 and region_filter=None"
-            )
-            self.config.labeller = Labeller(
-                LabellerConfig(connectivity=1, region_filter=None, output_type="list")
-            )
-        if self.config.do_regions and self.config.region_analyzer is None:
-            iterator_config = self.config.labeller.config.iterator_config
-            # Set properties based on region_filter if present, otherwise use defaults
-            if (
-                self.config.region_filter is not None
-                and self.config.region_filter.config.filters is not None
-            ):
-                # Extract filter attributes to ensure RegionAnalyzer computes them
-                filter_attributes = [
-                    filter.config.attribute
-                    for filter in self.config.region_filter.config.filters
-                    if filter.config.attribute is not None
-                ]
-                # Combine default properties with filter attributes (avoid duplicates)
-                properties = list(RegionAnalyzer.default_properties)
-                for attr in filter_attributes:
-                    if attr not in properties:
-                        properties.append(attr)
-            else:
-                properties = RegionAnalyzer.default_properties
-            logger.info(
-                f"RegionAnalyzer not provided, using default RegionAnalyzer with properties: {properties}"
-            )
-            self.config.region_analyzer = RegionAnalyzer(
-                RegionAnalyzerConfig(
-                    iterator_config=iterator_config,
-                    output_type="list",
-                    properties=properties,
-                )
-            )
-        logger.info(f"Segmenter config: {self.config}")
-
-    @task(name="Segmenter.run")
-    def run(
-        self,
-        img: np.ndarray,
-        include_mask: Optional[np.ndarray] = None,
-        exclude_mask: Optional[np.ndarray] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        **kwargs,
-    ) -> Union[
-        np.ndarray,
-        Tuple[np.ndarray, np.ndarray],
-        Tuple[np.ndarray, np.ndarray, List["RegionProperties"]],
-    ]:
-        """Run the segment step.
-
-        Args:
-            img (np.ndarray): Input image.
-            include_mask (Optional[np.ndarray]): Optional mask to include in the segmentation.
-            exclude_mask (Optional[np.ndarray]): Optional mask to exclude from the segmentation.
-            do_labels (bool): Whether to return labels.
-            do_regions (bool): Whether to return regions.
-
-        Returns:
-            Union[np.ndarray, Tuple[np.ndarray, List[RegionProps]]]: Binary mask or tuple of binary mask and regions.
-        """
-        # determine whether to compute regions and labels
-
-        # process the image
-        binary_mask = self.config.thresholder.run(img)
-        if include_mask is not None:
-            binary_mask = binary_mask & include_mask
-        if exclude_mask is not None:
-            binary_mask = binary_mask & ~exclude_mask
-        if self.config.binary_processor is not None:
-            binary_mask = self.config.binary_processor.run(binary_mask)
-        if self.config.do_labels:
-            labels, _ = self.config.labeller.run(binary_mask)
-            iterator_config = self.config.labeller.config.iterator_config
-            # update the labels to ensure they are unique across the substacks
-            relabeler = Relabeler(RelabelerConfig(iterator_config=iterator_config))
-            labels = relabeler.run(labels)
-            if self.config.do_regions:
-                regions = self.config.region_analyzer.run(labels)
-                # Flatten regions if it's a list of lists (from iterator processing)
-                if isinstance(regions, list) and len(regions) > 0:
-                    # Check if first element is a list (nested structure from iterator)
-                    if isinstance(regions[0], list):
-                        regions = [region for sublist in regions for region in sublist]
-                if self.config.region_filter is not None:
-                    regions, removed_labels = self.config.region_filter.run(regions)
-                    # remove the areas in labels corresponding to the removed regions
-                    label_remover = LabelRemover(
-                        LabelRemoverConfig(
-                            iterator_config=ArrayIteratorConfig(slice_def=()),
-                            output_type="stack",
-                            squeeze=False,
-                        )
-                    )
-                    labels = label_remover.run(labels, removed_labels)
-                return binary_mask, labels, regions
-            else:
-                logger.info("No regions to compute, returning binary mask and labels")
-                return binary_mask, labels
-        else:
-            logger.info("No labels or regions to compute, returning binary mask")
-            return binary_mask
-
-
 class IterativeSegmenterConfig(SegmenterConfig):
     """Configuration for iterative segmentation workflow.
 
@@ -970,8 +1200,8 @@ class IterativeSegmenter(Workflow):
                 raise ValueError(f"Mask must be 2D or 3D, got {mask.ndim}D")
         return mask
 
-    @task(name="IterativeSegmenter.run")
-    def run(
+    @task(name="IterativeSegmenter._run", task_run_name=generate_name)
+    def _run(
         self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the iterative segmentation workflow.
@@ -1080,8 +1310,8 @@ class SeriesSegmenter(Workflow):
         """
         super().__init__(config)
 
-    @task(name="SeriesSegmenter.run")
-    def run(
+    @task(name="SeriesSegmenter._run", task_run_name=generate_name)
+    def _run(
         self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> Union[np.ndarray, Tuple[np.ndarray, List["RegionProperties"]]]:
         """Run the series of segmenters on an image.
@@ -1136,13 +1366,23 @@ class MicroSAMSegmenterConfig(SegmenterConfig):
     """
 
     model_type: str = "vit_l_lm"
-    thresholder: Optional[Thresholder] = None
-    labeller: Optional[Labeller] = None
-    predictor: Optional[Any] = None
-    segmenter: Optional[Any] = None
+    # segmmentation_mode: Literal["ais", "amg", "apg"] = "ais" # need to upgrade micro_sam to support this
+    #predictor: Optional[Any] = None
+    #segmenter: Optional[Any] = None
     checkpoint: Optional[str] = None
     embedding_path: Optional[str] = None
+    pred_iou_thresh: float = 0.88
+    stability_score_thresh: float = 0.95
+    box_nms_thresh: float = 0.7
+    crop_nms_thresh: float = 0.7
+    min_mask_region_area: int = 0
+    output_mode: str = "instance_segmentation"
+    with_background: bool = True
     device: Optional[str] = None
+    device_no: int = 0
+    gpu_fraction: float = 1.0
+    preferred_backend: Literal["processes", "threads"] = "processes"
+    # ndim: Optional[int] = None # image specific, should be set at runtime if needed
 
 
 class MicroSAMSegmenter(Segmenter):
@@ -1159,15 +1399,18 @@ class MicroSAMSegmenter(Segmenter):
                 predictor, segmenter = get_predictor_and_segmenter(
                     model_type=self.config.model_type,
                     checkpoint=self.config.checkpoint,
+                    # segmentation_mode=self.config.segmmentation_mode,
                 )
             else:
                 predictor, segmenter = get_predictor_and_segmenter(
-                    model_type=self.config.model_type
+                    model_type=self.config.model_type,
+                    # segmentation_mode=self.config.segmmentation_mode,
                 )
         except TypeError:
             # Older micro_sam versions may not accept `checkpoint=...`
             predictor, segmenter = get_predictor_and_segmenter(
-                model_type=self.config.model_type
+                model_type=self.config.model_type,
+                # segmentation_mode=self.config.segmmentation_mode,
             )
             if self.config.checkpoint:
                 raise ValueError(
@@ -1175,61 +1418,380 @@ class MicroSAMSegmenter(Segmenter):
                     "passing `checkpoint` to get_predictor_and_segmenter."
                 )
 
-        if self.config.predictor is None:
-            self.config.predictor = predictor
-        if self.config.segmenter is None:
-            self.config.segmenter = segmenter
-        self.config.do_labels = True
+        self.predictor = predictor
+        self.segmenter = segmenter
+        # self.config.do_labels = True
         # self.config.do_regions = self.config.region_analyzer is not None
 
-    @flow(name="MicroSAMSegmenter.run")
-    def run(
-        self, img: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+    def _process_slice(
+        self, img_slice: np.ndarray, mask_path:Optional[Union[Union[PathLike, str], np.ndarray]] = None,metadata: Optional[dict[str, Any]] = None, **kwargs
     ) -> np.ndarray:
-        """Run the MicroSAM segmenter on an image.
+        import torch
+        if self.config.device is not None:
+            device = self.config.device
+        else:
+            device = check_device()
+        with torch.device(device):
+            set_fractional_memory(self.config.gpu_fraction, device=device)
+
+            if self.config.embedding_path is None:
+                self.config.embedding_path = (
+                    os.path.expanduser()
+                )  # create_unique_folder(base_path="embeddings")
+            arr_hash = array_content_digest(img_slice)
+            embedding_path = os.path.join(self.config.embedding_path, arr_hash)
+            os.makedirs(embedding_path, exist_ok=True)
+            logger.info(
+                f"Using {embedding_path} for embeddings. img_slice.shape={img_slice.shape}"
+            )
+
+            labels = automatic_instance_segmentation(
+                predictor=self.predictor,
+                segmenter=self.segmenter,
+                input_path=img_slice,
+                embedding_path=embedding_path,
+                # ndim=self.config.ndim,
+                # pred_iou_thresh=self.config.pred_iou_thresh,
+                # stability_score_thresh=self.config.stability_score_thresh,
+                # box_nms_thresh=self.config.box_nms_thresh,
+                # crop_nms_thresh=self.config.crop_nms_thresh,
+                # min_mask_region_area=self.config.min_mask_region_area,
+                # output_mode=self.config.output_mode,
+                # with_background=self.config.with_background,
+                # mask_path=mask_path,
+                # device=self.config.device,
+            )
+        
+        return labels
+
+
+class BasicSegmenterConfig(SegmenterConfig):
+    """Configuration for a threshold-based segmentation pipeline.
+
+    Defines a simple three-stage pipeline:
+    threshold -> optional binary post-processing -> connected-component labeling.
+
+    Attributes:
+        thresholder: Converts image intensities into a binary foreground mask.
+        binary_processor: Optional morphological cleanup on the binary mask.
+        labeller: Connected-component labeler applied to the final mask.
+    """
+
+    thresholder: Optional[Thresholder] = OtsuThreshold(OtsuThresholdConfig())
+    binary_processor: Optional[BinaryProcessor] = None
+    labeller: Optional[Labeller] = Labeller(
+        LabellerConfig(connectivity=1, region_filter=None, output_type="list")
+    )
+
+
+class BasicSegmenter(Segmenter):
+
+    def __init__(self, config: BasicSegmenterConfig):
+        super().__init__(config)
+
+    def _process_slice(self, slice, metadata: Optional[dict[str, Any]] = None):
+        mask = thresholder.run(slice, metadata=metadata)
+        if binary_processor is not None:
+            mask = binary_processor.run(mask, metadata=metadata)
+        labels = labeller.run(mask, metadata=metadata)
+        return labels
+
+
+class SegmentationFlowConfig(WorkflowConfig):
+    """Configuration for :class:`SegmentationFlow`.
+
+    Composes a segmenter with optional post-segmentation steps. The segmenter
+    (e.g. :class:`MicroSAMSegmenter` or :class:`BasicSegmenter`) is responsible
+    for producing label arrays; other fields refine or filter those labels.
+
+    Attributes:
+        segmenter: Configuration for the segmenter (e.g.
+            :class:`MicroSAMSegmenterConfig`). Instantiated per run in
+            :meth:`SegmentationFlow._run`. Its ``iterator_config`` also drives
+            relabeling when ``relabeler`` is omitted.
+        merger: Optional merger configuration (e.g. :class:`MicroSAMMergerConfig`).
+            Skipped when ``None``.
+        region_filter: Optional filter configuration. When set, a
+            :class:`RegionAnalyzer` and :class:`RegionFilter` are created per
+            run with properties required by the filter.
+        relabeler: Optional relabeler configuration. When ``None``, a
+            :class:`Relabeler` is built from ``segmenter.iterator_config``.
+    """
+
+    segmenter: SegmenterConfig = None
+    merger: Optional[MergerConfig] = None
+    # include_mask_detector: OverlapDetector
+    # exclude_mask_detector: OverlapDetector
+    region_filter: Optional[RegionFilterConfig] = None
+    relabeler: Optional[RelabelerConfig] = None
+
+
+class SegmentationFlow(Workflow):
+    """End-to-end segmentation workflow over an image stack.
+
+    Runs the configured :class:`Segmenter`, optionally merges slice-wise labels
+    into a 3D volume, applies include/exclude masks, ensures globally unique
+    label IDs via :class:`Relabeler`, and optionally filters regions by measured
+    properties.
+
+    Pipeline (when all optional steps are enabled)::
+
+        segmenter -> merger -> mask include/exclude -> relabeler -> region filter
+
+    Example::
+
+        flow = SegmentationFlow(
+            SegmentationFlowConfig(
+                segmenter=mscfg,
+                merger=mmcfg,
+                region_filter=rfcfg,
+            )
+        )
+        labels = flow.run(img, metadata=metadata)
+    """
+
+    @staticmethod
+    def _region_analyzer_for_filter(
+        region_filter_config: RegionFilterConfig,
+        iterator_config: ArrayIteratorConfig,
+    ) -> RegionAnalyzer:
+        """Build a :class:`RegionAnalyzer` with properties required by the filter config."""
+        filter_attributes = [
+            f.config.attribute
+            for f in region_filter_config.filters
+            if f.config.attribute is not None
+        ]
+        properties = list(RegionAnalyzer.default_properties)
+        properties += [attr for attr in filter_attributes if attr not in properties]
+        logger.info(
+            "Creating RegionAnalyzer for region filter with properties: %s",
+            properties,
+        )
+        return RegionAnalyzer(
+            RegionAnalyzerConfig(
+                iterator_config=iterator_config,
+                output_type="list",
+                properties=properties,
+            )
+        )
+
+    @task(name="SegmentationFlow._run", task_run_name=generate_name)
+    def _run(
+        self,
+        img: np.ndarray,
+        *args,
+        metadata: Optional[dict[str, Any]] = None,
+        include_masks: Optional[list[np.ndarray]] = None,
+        exclude_masks: Optional[list[np.ndarray]] = None,
+        **kwargs,
+    ) -> Union[np.ndarray, list[np.ndarray]]:
+        """Run the segmentation flow on an input image/stack.
 
         Args:
-            img: Input image to segment.
-            metadata: Optional metadata to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
+            img: Input image or stack.
+            metadata: Optional metadata describing the input.
+            include_masks: Optional masks multiplied into labels to keep only
+                selected regions.
+            exclude_masks: Optional masks multiplied out of labels to remove
+                selected regions.
+            *args: Additional positional arguments forwarded to processors.
+            **kwargs: Additional keyword arguments forwarded to processors.
 
         Returns:
-            Regions: List of regions.
+            Segmentation label array.
         """
-        if self.config.embedding_path is None:
-            self.config.embedding_path = create_unique_folder(base_path="embeddings")
-        labels = automatic_instance_segmentation(
-            predictor=self.config.predictor,
-            segmenter=self.config.segmenter,
-            input_path=img,
-            embedding_path=self.config.embedding_path,
-        )
-        binary_mask = np.zeros_like(labels).astype(bool)
-        binary_mask[labels > 0] = True
-        if self.config.do_regions:
-            regions = self.config.region_analyzer.run(labels, metadata=metadata)
-            # Flatten regions if it's a list of lists (from iterator processing)
+        logging.info(f"SegmentationFlow _run: channel_names={metadata.get('channel_names', None)}, channel_axis={metadata.get('channel_axis', None)}, axes={metadata.get('axes', None)}")
+
+        if self.config.segmenter is None:
+            raise ValueError("SegmentationFlowConfig.segmenter is required")
+
+        segmenter = Configurable.create_from_config(self.config.segmenter)
+        raw_labels, _ = segmenter.run(img, *args, metadata=metadata, **kwargs)
+
+        if self.config.merger is not None:
+            merger = Configurable.create_from_config(self.config.merger)
+            labels = merger.run(raw_labels, *args, metadata=metadata, **kwargs)
+        else:
+            labels = raw_labels
+
+        # mask labels
+        if include_masks is not None:
+            for mask in include_masks:
+                labels = labels * mask
+        if exclude_masks is not None:
+            for mask in exclude_masks:
+                labels = labels * ~mask
+
+        # update the labels to ensure they are unique across the substacks
+        l_before = np.unique(labels)
+        if self.config.relabeler is not None:
+            relabeler = Configurable.create_from_config(self.config.relabeler)
+        else:
+            relabeler = Relabeler(
+                RelabelerConfig(
+                    iterator_config=self.config.segmenter.iterator_config,
+                )
+            )
+        labels = relabeler.run(labels, *args, metadata=metadata, **kwargs)
+        l_after = np.unique(labels)
+        logger.debug(f"Relabeler: l_before == l_after:{l_before == l_after}")
+
+        # filter labels based on region properties
+        if self.config.region_filter is not None:
+            iterator_config = self.config.segmenter.iterator_config
+            region_analyzer = self._region_analyzer_for_filter(
+                self.config.region_filter,
+                iterator_config,
+            )
+            regions = region_analyzer.run(labels, *args, metadata=metadata, **kwargs)
             if isinstance(regions, list) and len(regions) > 0:
                 # Check if first element is a list (nested structure from iterator)
                 if isinstance(regions[0], list):
                     regions = [region for sublist in regions for region in sublist]
-            if self.config.region_filter is not None:
-                regions, removed_labels = self.config.region_filter.run(regions)
-                # remove the areas in labels corresponding to the removed regions
-                logger.info(
-                    f"Starting label removal with {len(removed_labels)} removed regions"
+            region_filter = Configurable.create_from_config(self.config.region_filter)
+            regions, removed_labels = region_filter.run(regions)
+            # remove the areas in labels corresponding to the removed regions
+            label_remover = LabelRemover(
+                LabelRemoverConfig(
+                    iterator_config=ArrayIteratorConfig(slice_def=()),
+                    remap=True,
+                    output_type="stack",
+                    squeeze=False,
                 )
-                label_remover = LabelRemover(
-                    LabelRemoverConfig(
-                        iterator_config=ArrayIteratorConfig(slice_def=()),
-                        remap=True,
-                        output_type="stack",
-                        squeeze=False,
-                    )
+            )
+            labels, _ = label_remover.run(labels, removed_labels)
+
+        return labels
+
+
+class TiledSegmentationFlowConfig(SegmentationFlowConfig):
+
+    tile_factor: Tuple[int, ...] = (3, 3)
+    resize_factor: Tuple[float, ...] = (0.25, 0.25)
+    pad_width: Union[int, Tuple[Tuple[int, int]], dict[int, Tuple[int, int]]] = {-2:(0,5), -1:(0,5)}
+    iou_threshold: float = 0.5
+    consensus_threshold: float = 0.5
+
+
+class TiledSegmentationFlow(SegmentationFlow):
+
+    def __init__(self, config: TiledSegmentationFlowConfig):
+        super().__init__(config)
+
+
+    @task(name="TiledSegmentationFlow._run", task_run_name=generate_name)
+    def _run(
+        self,
+        stack: np.ndarray,
+        *args,
+        metadata: Optional[dict[str, Any]] = None,
+        config: Optional[TiledSegmentationFlowConfig] = TiledSegmentationFlowConfig(),
+        **kwargs,
+    ):
+        """Run the tiled segmentation flow.
+
+        Args:
+            stack: The input stack.
+            *args: Additional arguments.
+            metadata: The metadata.
+            **kwargs: Additional keyword arguments.
+        """
+        # get original width and height
+        orig_width = stack.shape[-1]
+        orig_height = stack.shape[-2]
+
+        # resize
+        width = stack.shape[-1]*self.config.resize_factor[-1]
+        height = stack.shape[-2]*self.config.resize_factor[-2]
+        rcfg = ResizeConfig(width=width, height=height)
+        r_stack, r_metadata = Resize(rcfg).run(stack, metadata=metadata, **kwargs)
+
+        # tile with padding
+        tcfg = TilerConfig(factor=self.config.tile_factor, alt_flip=False, pad_width=self.config.pad_width)
+        t_stack,t_metadata = Tiler(tcfg).run(r_stack, *args,metadata=r_metadata, **kwargs)
+
+        # run segmentation on tiled stack
+        t_labels = super()._run(t_stack, *args, metadata=t_metadata, **kwargs)
+
+        # analyze regions
+        bbox_analyzer = RegionAnalyzer(
+            RegionAnalyzerConfig(
+                output_type="dataframe", 
+                properties=["bbox"],
+                iterator_config=ArrayIteratorConfig(slice_def=())
+            )
+        )
+        t_results = bbox_analyzer.run(t_labels, *args, metadata=t_metadata, **kwargs)
+
+        # group regions
+        divisor = t_labels.shape[-1] // self.config.tile_factor[-1]
+        spatial_ndim = t_labels.ndim if t_labels.ndim in (2, 3) else stack.ndim
+        logger.info(
+            f"Divisor: {divisor}, t_labels.shape: {t_labels.shape}, "
+            f"spatial_ndim: {spatial_ndim}, tile_factor: {self.config.tile_factor}, "
+            f"n_regions: {len(t_results)}"
+        )
+        bboxes = region_bbox_array(t_results, spatial_ndim)
+        if bboxes.shape[0] == 0:
+            logger.warning(
+                "TiledSegmentationFlow: no regions detected in tiled analysis; "
+                "returning zero labels"
+            )
+            return (
+                np.zeros(stack.shape, dtype=np.uint16),
+                t_labels,
+                np.empty((0, *t_labels.shape), dtype=bool),
+                np.empty((0, *t_labels.shape), dtype=bool),
+                np.zeros(t_labels.shape[-2:], dtype=bool),
+            )
+
+        t_groups = group_bboxes(
+            bboxes, divisor=divisor, threshold=self.config.iou_threshold
+        )
+
+        # convert labels to stack of masks: the stack will have shape (len(t_groups), *t_labels.shape)
+        t_masks = labels_to_masks(t_labels)
+
+        # untile: the tiles will be stacked and inserted as new axis 0 in untiled array. The untiled array will have shape (len(t_groups), *t_masks.shape)
+        ucfg = UntilerConfig(
+            factor = self.config.tile_factor,
+            iterator_config = ArrayIteratorConfig(slice_def=())
+        )
+        untiled,_ = Untiler(ucfg).run(t_masks)
+        t_proj =  np.sum(untiled>0, axis=0)>0
+
+        # label grouped mask
+        labels = label_grouped_mask(t_proj, t_groups, threshold=self.config.consensus_threshold)
+
+        # remove padding
+        cropped_height = labels.shape[-2]-self.config.pad_width[-2][1]
+        cropped_width = labels.shape[-1]-self.config.pad_width[-1][1]
+        cropped_labels = labels[..., 0:cropped_height, 0:cropped_width]
+
+        ecfg = ResizeConfig(width=orig_width, height=orig_height, normalize=False, dtype=np.uint16)
+        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
+
+        if resized_labels.shape != stack.shape:
+            logging.error(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
+            raise ValueError(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
+
+        if self.config.region_filter is not None:
+            region_analyzer = self._region_analyzer_for_filter(
+                self.config.region_filter,
+                self.config.segmenter.iterator_config,
+            )
+            r_results = region_analyzer.run(
+                resized_labels, metadata=metadata, **kwargs
+            )
+            region_filter = Configurable.create_from_config(self.config.region_filter)
+            _, removed_labels = region_filter.run(r_results)
+            label_remover = LabelRemover(
+                LabelRemoverConfig(
+                    iterator_config=ArrayIteratorConfig(slice_def=()),
+                    remap=True,
+                    output_type="stack",
+                    squeeze=False,
                 )
-                labels, newlabels_map = label_remover.run(labels, removed_labels)
-                regions = remap_regions(regions, newlabels_map, key="label")
-            return binary_mask, labels, regions
-        else:
-            logger.info("No regions to compute, returning binary mask and labels")
-            return binary_mask, labels, None
+            )
+            resized_labels, _ = label_remover.run(resized_labels, removed_labels)
+        return resized_labels, t_labels, t_masks, untiled, t_proj

@@ -14,7 +14,7 @@ from bioio import Dimensions, Scale
 from bioio_base.writer import Writer
 from vistiq.core import Configuration, Configurable
 from prefect import task
-from vistiq.utils import str_to_dict, NamedTuple
+from vistiq.utils import str_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +201,8 @@ def substack_to_slices(substack: Optional[str]) -> Optional[dict[str, slice]]:
 
 
 def unstack_image(
-    data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key: str = "axes"
-) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    data: np.ndarray, metadata: dict[str, Any], axis: Union[int, str], key: str = "axes", strict: bool = True
+) -> tuple[tuple[np.ndarray, ...], tuple[dict[str, Any], ...]]:
     """Split image data and metadata along a given axis.
 
     Splits the image array along the specified axis and updates metadata accordingly.
@@ -216,8 +216,8 @@ def unstack_image(
         key: Key in metadata dictionary that contains the axes labels. Default is "axes".
 
     Returns:
-        Tuple of (list of split image arrays, list of metadata dictionaries).
-        Each metadata dictionary corresponds to one split array. When splitting channels,
+        ``(data_tuple, metadata_tuple)`` — two tuples of equal length. Each
+        ``metadata_tuple[i]`` describes ``data_tuple[i]``. When splitting channels,
         each metadata dict contains a single channel name.
 
     Examples:
@@ -238,6 +238,13 @@ def unstack_image(
         axis_idx = metadata[key].index(axis)
     else:
         axis_idx = axis
+    if axis_idx is None:
+        if strict:
+            raise ValueError(f"Axis {axis} not found in metadata[{key}]")
+        else:
+            # add axis to data and wrap metadata in a list
+            logger.info(f"Axis {axis} not found in metadata[{key}]. Wrapping data and metadata in tuples.")
+            return (data,), (copy.deepcopy(metadata),)
     data = np.unstack(data, axis=axis_idx)
     new_shape = data[0].shape
     logger.info(
@@ -275,13 +282,13 @@ def unstack_image(
     if "dim_order" in metadata:
         metadata["dim_order"] = dim_str
     if splitting_channels:
-        new_metadata = [
+        new_metadata = tuple(
             copy.deepcopy(metadata) | {"channel_names": [channel_names[i]]}
             for i in range(len(data))
-        ]
+        )
     else:
-        new_metadata = [copy.deepcopy(metadata) for _ in range(len(data))]
-    return data, new_metadata
+        new_metadata = tuple(copy.deepcopy(metadata) for _ in range(len(data)))
+    return tuple(data), new_metadata
 
 
 def squeeze_image(
@@ -965,17 +972,16 @@ class ImageWriter(DataWriter):
         else:
             path = path.expanduser()
 
-        if os.path.exists(path) and not self.config.overwrite:
-            raise FileExistsError(f"File already exists: {path}")
-
         if metadata is None:
             metadata = {}
 
+        logger.info(f"ImageWriter: using config: {self.config}")
         logger.info(f"Preparing to save image with metadata: {metadata}")
         from collections import namedtuple
 
         PhysicalPixelSizes = namedtuple("PhysicalPixelSizes", ["Z", "Y", "X"])
-        if self.config.split_channels:
+        outpaths = []
+        if self.config.split_channels and "C" in metadata.get("axes", []):
             data, metadata = unstack_image(data, metadata, "C", key="axes")
             for img, m in zip(data, metadata):
                 channel_names = m.get("channel_names", [])
@@ -983,35 +989,43 @@ class ImageWriter(DataWriter):
                 physical_pixel_sizes = (
                     PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
                 )
+                outpath = path.with_suffix(
+                    f".{'-'.join(channel_names)}.{self.config.extension}"
+                )
+                if os.path.exists(outpath) and not self.config.overwrite:
+                    raise FileExistsError(f"File already exists: {outpath}")
 
                 OmeTiffWriter.save(
                     data=img,
-                    uri=path.with_suffix(
-                        f".{'-'.join(channel_names)}.{self.config.extension}"
-                    ),
+                    uri=outpath,
                     dim_order=m.get("dim_order", ""),
                     channel_names=m.get("channel_names", None),
                     image_name=m.get("image_names", None),
                     physical_pixel_sizes=physical_pixel_sizes,
                 )
+                outpaths.append(outpath)
         else:
             channel_names = metadata.get("channel_names", [])
             pps = metadata.get("physical_pixel_sizes", None)
             physical_pixel_sizes = (
                 PhysicalPixelSizes(*map(abs, pps)) if pps is not None else None
             )
+            outpath = path.with_suffix(
+                f".{'-'.join(channel_names)}.{self.config.extension}"
+            )
+            if os.path.exists(outpath) and not self.config.overwrite:
+                raise FileExistsError(f"File already exists: {outpath}")
 
             OmeTiffWriter.save(
                 data=data,
-                uri=path.with_suffix(
-                    f".{'-'.join(channel_names)}.{self.config.extension}"
-                ),
+                uri=outpath,
                 dim_order=metadata.get("dim_order", ""),
                 channel_names=metadata.get("channel_names", []),
                 image_name=metadata.get("image_names", ""),
                 physical_pixel_sizes=physical_pixel_sizes,
             )
-        logger.info(f"Saved image to {path}")
+            outpaths.append(outpath)
+        logger.info(f"Saved image to {outpaths}")
 
 
 class DataLoaderConfig(Configuration):
@@ -1105,6 +1119,10 @@ class ImageLoaderConfig(DataLoaderConfig):
     rename_channel: Optional[dict[str, str]] = Field(
         default=None,
         description="Dictionary mapping original channel names to new names (format: 'old1:new1;old2:new2')",
+    )
+    reader: Optional[type] = Field(
+        default=None,
+        description="Reader class to use. If None, bioio will auto-detect the appropriate reader.",
     )
 
     @field_validator("rename_channel", mode="before")
@@ -1342,6 +1360,7 @@ class ImageLoader(DataLoader):
             substack=substack_slices,
             squeeze=self.config.squeeze,
             rename_channel=self.config.rename_channel,
+            reader=self.config.reader,
         )
 
         # Apply grayscale conversion if requested

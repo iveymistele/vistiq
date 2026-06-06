@@ -1,5 +1,4 @@
 """Tests for vistiq.workflow_builder module."""
-import pytest
 from vistiq.workflow_builder import (
     ComponentRegistry,
     get_registry,
@@ -7,8 +6,7 @@ from vistiq.workflow_builder import (
     WorkflowBuilder,
     auto_register_configurables,
 )
-from vistiq.core import Configuration, Configurable, StackProcessorConfig, StackProcessor
-from vistiq.utils import ArrayIteratorConfig
+from vistiq.core import Configuration, Configurable, StackProcessorConfig
 
 
 class ConcreteConfigurable(Configurable):

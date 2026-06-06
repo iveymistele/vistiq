@@ -1,27 +1,105 @@
 import logging
+import uuid
 from functools import wraps
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from prefect import task
-from skimage.measure import label as sk_label, regionprops, regionprops_table
+from skimage.measure import label as sk_label, regionprops, regionprops_table, perimeter
 
 from vistiq.core import StackProcessor, StackProcessorConfig
 from vistiq.segment._debug import debug_mask_labels
+from vistiq.utils import ArrayIteratorConfig, axis_labels_from_metadata
 
 logger = logging.getLogger(__name__)
 
 
 class RegionAnalyzer(StackProcessor):
-    """Analyzer that extracts region properties from labeled images.
+    """Extract region properties from labeled images.
 
-    Computes properties for each labeled region, including built-in properties
-    from scikit-image and custom extra properties like circularity and aspect ratio.
+    Wraps :func:`skimage.measure.regionprops` (or ``regionprops_table``) and
+    adds vistiq-specific identifiers, optional axis-aware column names, and
+    custom shape metrics. Iteration over the label stack is controlled by
+    :attr:`RegionAnalyzerConfig.iterator_config` (inherited from
+    :class:`~vistiq.core.StackProcessor`).
+
+    Mandatory outputs
+        Every region includes ``label``, a unique ``object_id``, a shared
+        ``slice_id`` per iterator slice, and a shared ``stack_id`` per
+        :meth:`run` call (:attr:`mandatory_properties`).
+
+    Custom extra properties
+        :meth:`extra_properties_funcs` registers ``circularity``, ``sphericity``,
+        ``aspect_ratio``, ``cross_sectional_area``, and ``volume``.
+
+    Area vs volume
+        scikit-image ``area`` on ``ndim >= 3`` label slices is voxel count (volume).
+        :meth:`_relabel_area_as_volume` exposes it as ``volume`` in outputs. For
+        2D slices the column/attribute remains ``area``. regionprops runs with
+        the original signed spacing (needed for coordinates such as centroid);
+        :meth:`_ensure_positive_extent_values` then makes area/volume/cross-section
+        non-negative.
+
+    Vector properties (``cross_sectional_area``, ``aspect_ratio``)
+        For ``ndim > 2`` these return tuples — one entry per orthogonal plane
+        (``aspect_ratio`` also appends an overall value). For 2D slices they
+        return a single scalar.
+
+        * **DataFrame** — set ``map_axes=True`` to rename ``prop-0`` columns
+          to axis or plane labels (``centroid-y``, ``cross_sectional_area-xy``,
+          ``aspect_ratio`` for the overall component).
+        * **List** — include mapped names in ``properties`` (e.g.
+          ``cross_sectional_area-xy``); :meth:`_expand_mapped_property_attributes`
+          attaches scalar components for :class:`~vistiq.segment.select.RegionFilter`.
+        * :meth:`get_region_attribute` resolves mapped names and treats bare
+          ``aspect_ratio`` as the overall scalar; bare ``cross_sectional_area``
+          requires a plane suffix.
+
+    Slice annotations
+        When ``slice_annotations`` appears in ``properties``, per-slice axis
+        indices from the stack iterator are attached as dataframe columns or list
+        attributes. Keys use lowercase axis labels (``c``, ``z``, …).
+
+    Metadata
+        Optional. ``metadata['scale']`` supplies voxel spacing; ``metadata['axes']``
+        (or ``axis`` / ``dim_order``) drives axis renaming. If metadata is
+        ``None`` or lacks axes, generic labels ``axis_0``, ``axis_1``, … are
+        used.
+
+    Attributes:
+        mandatory_properties: Always attached — ``label``, ``object_id``,
+            ``slice_id``, ``stack_id``.
+        default_properties: ``mandatory_properties`` plus ``centroid``.
+        postcomputed_properties: Set after regionprops; not passed to scikit-image
+            as ``extra_properties`` (includes ``slice_annotations``).
     """
 
-    default_properties: List[str] = ["label", "centroid"]
+    mandatory_properties: ClassVar[tuple[str, ...]] = (
+        "label",
+        "object_id",
+        "slice_id",
+        "stack_id",
+    )
+    default_properties: ClassVar[tuple[str, ...]] = mandatory_properties + ("centroid",)
+    postcomputed_properties: ClassVar[frozenset[str]] = frozenset(
+        {"object_id", "slice_id", "stack_id", "slice_annotations"}
+    )
+
+    @classmethod
+    def ensure_mandatory_properties(cls, properties: List[str]) -> List[str]:
+        """Return *properties* with :attr:`mandatory_properties` present (stable order)."""
+        props = list(properties)
+        for name in cls.mandatory_properties:
+            if name not in props:
+                if name == "label":
+                    props.insert(0, name)
+                elif "label" in props:
+                    props.insert(props.index("label") + 1, name)
+                else:
+                    props.insert(0, name)
+        return props
 
     def __init__(self, config: "RegionAnalyzerConfig"):
         """Initialize the region analyzer.
@@ -69,7 +147,253 @@ class RegionAnalyzer(StackProcessor):
         return sorted(
             RegionAnalyzer.builtin_properties()
             + list(RegionAnalyzer.extra_properties_funcs().keys())
+            + list(RegionAnalyzer.postcomputed_properties)
         )
+
+    @classmethod
+    def is_allowed_property_name(cls, name: Optional[str]) -> bool:
+        """Whether *name* is a valid base property or mapped column identifier.
+
+        Accepts scikit-image property names, custom extras, postcomputed names
+        (``slice_annotations``), and ``map_axes`` forms such as ``centroid-y``,
+        ``bbox-start-z``, ``cross_sectional_area-xy``, and ``aspect_ratio-0``.
+        """
+        if name is None:
+            return True
+
+        allowed = set(cls.allowed_properties())
+        if name in allowed:
+            return True
+
+        parts = name.split("-")
+        if (
+            len(parts) == 3
+            and parts[0] == "bbox"
+            and parts[1] in ("start", "end")
+            and parts[2]
+            and "bbox" in allowed
+        ):
+            return True
+
+        if "-" in name:
+            prop, suffix = name.rsplit("-", 1)
+            if prop in allowed and suffix:
+                return True
+
+        return False
+
+    @classmethod
+    def is_allowed_filter_attribute(cls, attribute: Optional[str]) -> bool:
+        """Alias for :meth:`is_allowed_property_name` (RangeFilter compatibility)."""
+        return cls.is_allowed_property_name(attribute)
+
+    @classmethod
+    def base_property_name(cls, name: str) -> str:
+        """Map a property or mapped column name to its regionprops base name.
+
+        Examples: ``cross_sectional_area-xy`` → ``cross_sectional_area``,
+        ``bbox-start-z`` → ``bbox``, ``centroid-y`` → ``centroid``.
+        """
+        if name in cls.allowed_properties():
+            return name
+
+        parts = name.split("-")
+        if (
+            len(parts) == 3
+            and parts[0] == "bbox"
+            and parts[1] in ("start", "end")
+            and "bbox" in cls.allowed_properties()
+        ):
+            return "bbox"
+
+        if "-" in name:
+            prop, _suffix = name.rsplit("-", 1)
+            if prop in cls.allowed_properties():
+                return prop
+
+        return name
+
+    @classmethod
+    def component_from_mapped_name(
+        cls,
+        name: str,
+        base_value: Any,
+        slice_axis_labels: List[str],
+    ) -> Any:
+        """Extract one scalar component from a vector base property value.
+
+        Args:
+            name: Mapped property name (e.g. ``cross_sectional_area-xy``).
+            base_value: Value from regionprops (tuple, scalar, or array).
+            slice_axis_labels: Axis labels for the analyzed slice dimensions.
+
+        Returns:
+            Scalar component, or ``None`` if *name* does not match *base_value*.
+        """
+        if name == cls.base_property_name(name):
+            return base_value
+
+        ndim = len(slice_axis_labels)
+        axis_names = [str(axis).lower() for axis in slice_axis_labels]
+        plane_pairs = cls.cross_sectional_area_plane_indices(ndim)
+        base = cls.base_property_name(name)
+
+        if base == "bbox":
+            parts = name.split("-")
+            if len(parts) == 3 and parts[1] in ("start", "end") and parts[2] in axis_names:
+                idx = axis_names.index(parts[2])
+                bbox = tuple(base_value)
+                if parts[1] == "start":
+                    return bbox[idx]
+                return bbox[idx + ndim]
+            return None
+
+        suffix = name.rsplit("-", 1)[1]
+
+        if base in ("cross_sectional_area", "aspect_ratio"):
+            if isinstance(base_value, (tuple, list)) and suffix.isdigit():
+                idx = int(suffix)
+                if base == "aspect_ratio" and idx == len(plane_pairs) and ndim > 2:
+                    return base_value[idx]
+                if 0 <= idx < len(base_value):
+                    return base_value[idx]
+            if ndim == 2 and len(plane_pairs) == 1:
+                plane = cls.cross_sectional_area_plane_label(slice_axis_labels, 0, 1)
+                if plane == suffix:
+                    if isinstance(base_value, (tuple, list)):
+                        return base_value[0]
+                    return base_value
+            if isinstance(base_value, (tuple, list)):
+                for i, (axis_i, axis_j) in enumerate(plane_pairs):
+                    plane = cls.cross_sectional_area_plane_label(
+                        slice_axis_labels, axis_i, axis_j
+                    )
+                    if plane == suffix:
+                        return base_value[i]
+            return None
+
+        if isinstance(base_value, (tuple, list, np.ndarray)) and suffix in axis_names:
+            return base_value[axis_names.index(suffix)]
+
+        return None
+
+    @classmethod
+    def _region_slice_axes(cls, region: Any) -> Optional[List[str]]:
+        """Return slice axis labels stored on *region*, if available."""
+        slice_axes = region.__dict__.get("_vistiq_slice_axes")
+        if slice_axes is not None:
+            return list(slice_axes)
+        if hasattr(region, "image") and region.image is not None:
+            ndim = region.image.ndim
+            return [f"axis_{i}" for i in range(ndim)]
+        return None
+
+    @classmethod
+    def _scalar_from_base_property(cls, name: str, value: Any) -> Any:
+        """Return a scalar when *name* is an unmapped vector extra property.
+
+        Raises:
+            AttributeError: If *name* is ``cross_sectional_area`` but *value* is
+                a multi-component tuple (use e.g. ``cross_sectional_area-xy``).
+        """
+        if not isinstance(value, (tuple, list, np.ndarray)):
+            return value
+        if name == "aspect_ratio":
+            # 3D+ tuples are (per-plane..., overall); overall is always last.
+            return value[-1]
+        if name == "cross_sectional_area":
+            raise AttributeError(
+                "cross_sectional_area is a per-plane vector; use a mapped name "
+                "such as 'cross_sectional_area-xy'"
+            )
+        return value
+
+    def _expand_mapped_property_attributes(
+        self,
+        regions: List[Any],
+        labels_ndim: int,
+        metadata: Optional[dict[str, Any]],
+    ) -> List[Any]:
+        """Attach mapped property scalars and slice axis labels to each region.
+
+        Always sets ``_vistiq_slice_axes`` on each region. Names in
+        ``config.properties`` that differ from their base property (e.g.
+        ``cross_sectional_area-xy``) are resolved and stored on ``region.__dict__``
+        for :meth:`get_region_attribute` and :class:`~vistiq.segment.select.RegionFilter`.
+        """
+        mapped_names = {
+            name
+            for name in self.config.properties
+            if name != RegionAnalyzer.base_property_name(name)
+        }
+        slice_axes = self._slice_axis_labels(labels_ndim, metadata)
+        for region in regions:
+            region.__dict__["_vistiq_slice_axes"] = slice_axes
+            for name in mapped_names:
+                base = RegionAnalyzer.base_property_name(name)
+                try:
+                    base_value = getattr(region, base)
+                except AttributeError:
+                    continue
+                component = RegionAnalyzer.component_from_mapped_name(
+                    name, base_value, slice_axes
+                )
+                if component is not None:
+                    region.__dict__[name] = component
+        return regions
+
+    @classmethod
+    def get_region_attribute(cls, region: Any, name: str) -> Any:
+        """Read a property from a region, including mapped axis/plane names.
+
+        Resolution order: expanded ``__dict__`` entry, mapped name via
+        :meth:`component_from_mapped_name`, then base ``getattr``. Vector extras
+        are unpacked where defined (overall ``aspect_ratio``; plane-specific
+        ``cross_sectional_area`` requires a suffix).
+
+        Args:
+            region: A :class:`skimage.measure.RegionProperties` instance.
+            name: Base or mapped property name.
+
+        Returns:
+            Property value (scalar for filtered attributes).
+
+        Raises:
+            AttributeError: If the property or component cannot be resolved.
+        """
+        if name in region.__dict__:
+            val = region.__dict__[name]
+            if name == cls.base_property_name(name):
+                return cls._scalar_from_base_property(name, val)
+            return val
+
+        base = cls.base_property_name(name)
+        if name != base:
+            slice_axes = cls._region_slice_axes(region)
+            if slice_axes is None:
+                raise AttributeError(
+                    f"'{type(region).__name__}' object has no attribute '{name}'"
+                )
+            try:
+                base_value = getattr(region, base)
+            except AttributeError as exc:
+                raise AttributeError(
+                    f"'{type(region).__name__}' object has no attribute '{name}'"
+                ) from exc
+            component = cls.component_from_mapped_name(name, base_value, slice_axes)
+            if component is None:
+                raise AttributeError(
+                    f"'{type(region).__name__}' object has no attribute '{name}'"
+                )
+            return component
+
+        try:
+            value = getattr(region, name)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{type(region).__name__}' object has no attribute '{name}'"
+            ) from exc
+        return cls._scalar_from_base_property(name, value)
 
     def used_extra_properties(self) -> List[str]:
         """Get list of extra properties that are being used.
@@ -77,13 +401,18 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             List of extra property names from config that are custom properties.
         """
-        return sorted(
-            [
-                prop
-                for prop in self.config.properties
-                if prop in RegionAnalyzer.extra_properties_funcs().keys()
-            ]
-        )
+        bases: List[str] = []
+        seen: set[str] = set()
+        for prop in self.config.properties:
+            base = RegionAnalyzer.base_property_name(prop)
+            if (
+                base in RegionAnalyzer.extra_properties_funcs()
+                and base not in RegionAnalyzer.postcomputed_properties
+                and base not in seen
+            ):
+                seen.add(base)
+                bases.append(base)
+        return sorted(bases)
 
     def used_extra_properties_funcs(
         self, spacing: Optional[Tuple[float, ...]] = None
@@ -140,11 +469,15 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             List of built-in property names from config.
         """
-        return [
-            prop
-            for prop in self.config.properties
-            if prop in RegionAnalyzer.builtin_properties()
-        ]
+        bases: List[str] = []
+        seen: set[str] = set()
+        builtin = set(RegionAnalyzer.builtin_properties())
+        for prop in self.config.properties:
+            base = RegionAnalyzer.base_property_name(prop)
+            if base in builtin and base not in seen:
+                seen.add(base)
+                bases.append(base)
+        return bases
 
     @classmethod
     def from_config(cls, config: "RegionAnalyzerConfig") -> "RegionAnalyzer":
@@ -154,9 +487,249 @@ class RegionAnalyzer(StackProcessor):
             config: RegionAnalyzer configuration.
 
         Returns:
-            A new RegionProcessor instance.
+            A new RegionAnalyzer instance.
         """
         return cls(config)
+
+    @staticmethod
+    def new_id() -> str:
+        """Return a new unique id (thread/process safe via :func:`uuid.uuid4`)."""
+        return uuid.uuid4().hex
+
+    @classmethod
+    def new_object_id(cls) -> str:
+        """Return a new unique object id."""
+        return cls.new_id()
+
+    @classmethod
+    def new_slice_id(cls) -> str:
+        """Return a new unique slice id."""
+        return cls.new_id()
+
+    @classmethod
+    def new_stack_id(cls) -> str:
+        """Return a new unique stack id."""
+        return cls.new_id()
+
+    def _assign_object_ids(
+        self, results: List[Any] | pd.DataFrame
+    ) -> List[Any] | pd.DataFrame:
+        """Attach a unique ``object_id`` to each region after regionprops."""
+        if isinstance(results, list):
+            for region in results:
+                setattr(region, "object_id", self.new_object_id())
+        elif isinstance(results, pd.DataFrame):
+            n = len(results)
+            if n:
+                results = results.copy()
+                results["object_id"] = [self.new_object_id() for _ in range(n)]
+        return results
+
+    def _assign_stack_and_slice_ids(
+        self,
+        results: List[Any] | pd.DataFrame,
+        stack_id: str,
+        slice_id: str,
+    ) -> List[Any] | pd.DataFrame:
+        """Attach shared ``stack_id`` and ``slice_id`` to each region in a slice."""
+        if isinstance(results, list):
+            for region in results:
+                setattr(region, "stack_id", stack_id)
+                setattr(region, "slice_id", slice_id)
+        elif isinstance(results, pd.DataFrame):
+            n = len(results)
+            if n:
+                results = results.copy()
+                results["stack_id"] = stack_id
+                results["slice_id"] = slice_id
+        return results
+
+    def _slice_axis_labels(
+        self,
+        labels_ndim: int,
+        metadata: Optional[dict[str, Any]],
+    ) -> List[str]:
+        """Axis labels for the slice dimensions passed to regionprops.
+
+        Uses ``metadata['axes']`` (via :func:`~vistiq.utils.axis_labels_from_metadata`)
+        and ``iterator_config.slice_def`` to select labels for the analyzed
+        sub-array. Falls back to ``axis_0``, ``axis_1``, … when metadata is
+        ``None`` or labels cannot be mapped.
+        """
+        axis_labels = axis_labels_from_metadata(metadata)
+        if not axis_labels:
+            return [f"axis_{i}" for i in range(labels_ndim)]
+
+        stack_ndim = len(axis_labels)
+        slice_def = self.config.iterator_config.slice_def
+        if len(slice_def) == 0:
+            if labels_ndim <= stack_ndim:
+                return list(axis_labels[:labels_ndim])
+            return [f"axis_{i}" for i in range(labels_ndim)]
+
+        normalized = tuple(
+            axis if axis >= 0 else stack_ndim + axis for axis in slice_def
+        )
+        mapped = [axis_labels[i] for i in normalized if i < len(axis_labels)]
+        if len(mapped) != labels_ndim:
+            logger.warning(
+                "slice_def maps to %d axis labels but slice has %d dimensions; "
+                "falling back to generic axis names",
+                len(mapped),
+                labels_ndim,
+            )
+            return [f"axis_{i}" for i in range(labels_ndim)]
+        return mapped
+
+    @staticmethod
+    def map_dataframe_axis_columns(
+        df: pd.DataFrame,
+        slice_axis_labels: List[str],
+    ) -> pd.DataFrame:
+        """Rename ``property-N`` columns using slice axis labels.
+
+        ``bbox`` mins/maxes become ``bbox-start-{axis}`` / ``bbox-end-{axis}``.
+        For ``ndim > 2``, ``cross_sectional_area`` and ``aspect_ratio`` tuple
+        columns map to plane labels (``cross_sectional_area-xy``, …); the last
+        ``aspect_ratio`` component becomes ``aspect_ratio``. Other vector
+        properties map ``prop-i`` → ``prop-{axis}``.
+
+        Args:
+            df: DataFrame from ``regionprops_table``.
+            slice_axis_labels: Labels for each dimension of the analyzed slice.
+
+        Returns:
+            DataFrame with renamed columns (unchanged if nothing to rename).
+        """
+        ndim = len(slice_axis_labels)
+        if ndim == 0:
+            return df
+
+        axis_names = [str(axis).lower() for axis in slice_axis_labels]
+        plane_pairs = RegionAnalyzer.cross_sectional_area_plane_indices(ndim)
+        rename: dict[str, str] = {}
+        for col in df.columns:
+            if "-" not in col:
+                continue
+            prop, suffix = col.rsplit("-", 1)
+            if not suffix.isdigit():
+                continue
+            i = int(suffix)
+            if prop == "bbox":
+                if i < ndim:
+                    rename[col] = f"bbox-start-{axis_names[i]}"
+                elif i < 2 * ndim:
+                    rename[col] = f"bbox-end-{axis_names[i - ndim]}"
+            elif prop == "cross_sectional_area" and ndim > 2 and i < len(plane_pairs):
+                axis_i, axis_j = plane_pairs[i]
+                plane = RegionAnalyzer.cross_sectional_area_plane_label(
+                    slice_axis_labels, axis_i, axis_j
+                )
+                rename[col] = f"cross_sectional_area-{plane}"
+            elif prop == "aspect_ratio" and ndim > 2:
+                if i < len(plane_pairs):
+                    axis_i, axis_j = plane_pairs[i]
+                    plane = RegionAnalyzer.cross_sectional_area_plane_label(
+                        slice_axis_labels, axis_i, axis_j
+                    )
+                    rename[col] = f"aspect_ratio-{plane}"
+                elif i == len(plane_pairs):
+                    rename[col] = "aspect_ratio"
+            elif i < ndim:
+                rename[col] = f"{prop}-{axis_names[i]}"
+
+        if rename:
+            df = df.rename(columns=rename)
+        return df
+
+    def _assign_slice_annotations(
+        self,
+        results: List[Any] | pd.DataFrame,
+        slice_annotations: Optional[dict[str, Any]],
+    ) -> List[Any] | pd.DataFrame:
+        """Attach per-slice axis indices as columns (dataframe) or attributes (list).
+
+        Axis keys are normalized to lowercase (``c``, ``z``, …) to match ``map_axes``.
+        Values are stored as ``int64`` (dataframe columns) or Python ``int`` (list attr).
+        """
+        if not slice_annotations or "slice_annotations" not in self.config.properties:
+            return results
+
+        normalized = {str(k).lower(): int(v) for k, v in slice_annotations.items()}
+
+        if isinstance(results, pd.DataFrame):
+            results = results.copy()
+            n = len(results)
+            for key, value in normalized.items():
+                if n:
+                    results[key] = np.full(n, value, dtype=np.int64)
+                else:
+                    results[key] = pd.Series(dtype=np.int64)
+        elif isinstance(results, list):
+            for region in results:
+                setattr(region, "slice_annotations", dict(normalized))
+        return results
+
+    @staticmethod
+    def _positive_extent_value(value: Any) -> Any:
+        """Return a non-negative scalar or tuple of scalars (area/volume/cross-section)."""
+        if isinstance(value, (tuple, list)):
+            return type(value)(float(abs(v)) for v in value)
+        return float(abs(value))
+
+    @classmethod
+    def _ensure_positive_extent_values(
+        cls, results: List[Any] | pd.DataFrame
+    ) -> List[Any] | pd.DataFrame:
+        """Ensure area, volume, and cross-sectional area measurements are non-negative."""
+        if isinstance(results, pd.DataFrame):
+            results = results.copy()
+            for col in results.columns:
+                if col in ("area", "volume") or col.startswith("cross_sectional_area"):
+                    results[col] = results[col].abs()
+            return results
+
+        for region in results:
+            for prop in ("area", "volume", "cross_sectional_area"):
+                if not hasattr(region, prop):
+                    continue
+                val = getattr(region, prop)
+                if isinstance(val, (tuple, list, np.ndarray)):
+                    if prop == "cross_sectional_area":
+                        continue
+                    val = cls._positive_extent_value(val)
+                else:
+                    val = cls._positive_extent_value(val)
+                region.__dict__[prop] = val
+            for key, val in list(region.__dict__.items()):
+                if key.startswith("cross_sectional_area-"):
+                    region.__dict__[key] = cls._positive_extent_value(val)
+        return results
+
+    @staticmethod
+    def _relabel_area_as_volume(
+        results: List[Any] | pd.DataFrame, labels_ndim: int
+    ) -> List[Any] | pd.DataFrame:
+        """Rename regionprops ``area`` to ``volume`` when the label slice is 3D+.
+
+        scikit-image ``area`` counts voxels for ``ndim >= 3``; expose it as
+        ``volume`` in outputs. No-op for 2D slices or when ``volume`` is already
+        present (e.g. from the custom :meth:`volume` extra property).
+        """
+        if labels_ndim < 3:
+            return results
+
+        if isinstance(results, pd.DataFrame):
+            if "area" not in results.columns:
+                return results
+            if "volume" in results.columns:
+                return results.drop(columns=["area"])
+            return results.rename(columns={"area": "volume"})
+
+        for region in results:
+            if hasattr(region, "area"):
+                region.__dict__["volume"] = float(abs(region.area))
+        return results
 
     @staticmethod
     def circularity(regionmask, intensity_image=None, spacing=None):
@@ -172,7 +745,8 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Circularity value (1.0 for perfect circle), or NaN if invalid.
         """
-        from skimage.measure import perimeter
+        if regionmask.ndim == 3:
+            return float("nan")
 
         perim = perimeter(regionmask)
         area = np.sum(regionmask)
@@ -195,6 +769,9 @@ class RegionAnalyzer(StackProcessor):
         Returns:
             Sphericity value (1.0 for perfect sphere), or NaN if invalid.
         """
+        if regionmask.ndim == 2:
+            return float("nan")
+
         volume = np.sum(regionmask)
         if volume == 0:
             return float("nan")
@@ -244,74 +821,141 @@ class RegionAnalyzer(StackProcessor):
             return float("nan")
 
     @staticmethod
+    def _aspect_ratio_for_axes(
+        regionmask: np.ndarray,
+        axis_indices: Tuple[int, ...],
+        spacing: Optional[np.ndarray] = None,
+    ) -> float:
+        """Aspect ratio from the covariance matrix along selected axes."""
+        coords = np.where(regionmask)
+        if len(coords[0]) == 0 or len(axis_indices) < 2:
+            return float("nan")
+
+        coords_rows: List[np.ndarray] = []
+        for axis in axis_indices:
+            row = coords[axis].astype(np.float64)
+            if spacing is not None and spacing.size > axis:
+                row = row * float(spacing[axis])
+            coords_rows.append(row)
+
+        coords_array = np.array(coords_rows, dtype=np.float64)
+        centroid = np.mean(coords_array, axis=1)
+        coords_centered = coords_array - centroid[:, np.newaxis]
+        if coords_centered.shape[1] < len(axis_indices):
+            return float("nan")
+
+        cov = np.cov(coords_centered)
+        if np.ndim(cov) < 2:
+            return float("nan")
+
+        eigenvalues = np.linalg.eigvals(cov)
+        if len(eigenvalues) < 2 or np.any(eigenvalues <= 0):
+            return float("nan")
+
+        eigenvalues = np.sort(eigenvalues)[::-1]
+        return float(np.sqrt(eigenvalues[-1] / eigenvalues[0]))
+
+    @staticmethod
     def aspect_ratio(regionmask, intensity_image=None, spacing=None):
-        """Compute aspect ratio: minor_axis_length / major_axis_length.
+        """Aspect ratio per orthogonal plane plus an all-axis value (3D+ only).
 
-        Computes aspect ratio from the covariance matrix of region coordinates.
-        Works for both 2D and 3D regions. The aspect ratio is the ratio of the
-        smallest to largest eigenvalue of the covariance matrix.
-
-        If spacing is provided, coordinates are scaled by spacing to account for
-        anisotropic voxels.
+        For ``ndim > 2`` (e.g. ZYX) returns ``(yz, xz, xy, overall)``. For 2D
+        slices returns a single scalar. scikit-image expands 3D+ tuples as
+        ``aspect_ratio-0``..``aspect_ratio-N``; the last index is renamed to
+        ``aspect_ratio`` when ``map_axes`` is enabled.
 
         Args:
             regionmask: Binary mask of the region (2D or 3D).
             intensity_image: Optional intensity image (not used).
-            spacing: Optional spacing tuple for anisotropic voxels.
+            spacing: Optional per-axis spacing for the slice dimensions.
 
         Returns:
-            Aspect ratio (minor/major axis), or NaN if invalid.
+            Scalar for 2D, or tuple of in-plane ratios plus all-dimension ratio.
         """
-        coords = np.where(regionmask)
-        if len(coords[0]) == 0:
-            return float("nan")
-
         ndim = regionmask.ndim
-
-        # Create coordinate array for all dimensions
-        coords_array = np.array([coords[i] for i in range(ndim)], dtype=np.float64)
-
-        # Scale coordinates by spacing if provided (broadcasting)
-        if spacing is not None and len(spacing) >= ndim:
-            spacing_array = np.array(spacing[:ndim], dtype=np.float64)
-            coords_array = coords_array * spacing_array[:, np.newaxis]
-
-        centroid = np.mean(coords_array, axis=1)
-        coords_centered = coords_array - centroid[:, np.newaxis]
-
-        if coords_centered.shape[1] < ndim:
+        if ndim < 2:
             return float("nan")
 
-        cov = np.cov(coords_centered)
-        eigenvalues = np.linalg.eigvals(cov)
-        if len(eigenvalues) < ndim or np.any(eigenvalues <= 0):
-            return float("nan")
+        spacing_arr: Optional[np.ndarray] = None
+        if spacing is not None:
+            spacing_arr = np.abs(np.asarray(spacing[:ndim], dtype=np.float64))
 
-        # Sort eigenvalues (largest first)
-        eigenvalues = np.sort(eigenvalues)[::-1]
-        # Aspect ratio: smallest / largest eigenvalue
-        return float(np.sqrt(eigenvalues[-1] / eigenvalues[0]))
+        if ndim == 2:
+            return RegionAnalyzer._aspect_ratio_for_axes(
+                regionmask, (0, 1), spacing=spacing_arr
+            )
+
+        values: List[float] = []
+        for axis_i, axis_j in RegionAnalyzer.cross_sectional_area_plane_indices(ndim):
+            values.append(
+                RegionAnalyzer._aspect_ratio_for_axes(
+                    regionmask, (axis_i, axis_j), spacing=spacing_arr
+                )
+            )
+        values.append(
+            RegionAnalyzer._aspect_ratio_for_axes(
+                regionmask, tuple(range(ndim)), spacing=spacing_arr
+            )
+        )
+        return tuple(values)
+
+    @staticmethod
+    def cross_sectional_area_plane_indices(ndim: int) -> List[Tuple[int, int]]:
+        """Return in-plane axis index pairs ``(i, j)`` with ``i < j``."""
+        return [(i, j) for i in range(ndim) for j in range(i + 1, ndim)]
+
+    @staticmethod
+    def cross_sectional_area_plane_label(
+        axis_labels: List[str], axis_i: int, axis_j: int
+    ) -> str:
+        """Build a plane label from two axis names (e.g. ``'xy'`` from Y and X)."""
+        names = sorted(
+            [str(axis_labels[axis_i]).lower(), str(axis_labels[axis_j]).lower()]
+        )
+        return "".join(names)
 
     @staticmethod
     def cross_sectional_area(regionmask, intensity_image=None, spacing=None):
-        """Compute the maximum cross-sectional area in the xy plane of the region.
+        """Maximum cross-sectional area for each orthogonal plane (3D+ only).
+
+        For each in-plane axis pair, sum the mask within that plane, then take
+        the maximum over the reduced array (all dimensions orthogonal to the plane).
+        For ``ndim > 2`` (e.g. ZYX) returns one value per plane (yz, xz, xy).
+        For 2D slices returns a single scalar. scikit-image expands 3D+ tuples as
+        ``cross_sectional_area-0``, etc.; :meth:`map_dataframe_axis_columns`
+        renames these when ``map_axes`` is on.
 
         Args:
             regionmask: Binary mask of the region.
             intensity_image: Optional intensity image (not used).
-            spacing: Optional spacing tuple for anisotropic voxels.
+            spacing: Optional per-axis spacing for the slice dimensions.
+
         Returns:
-            Maximum cross-sectional area as a float.
+            Scalar for 2D, or tuple of cross-sectional areas per plane.
         """
-        # Sum along the last two spatial dimensions (typically Y and X)
-        pixel_count = float(np.max(np.sum(regionmask, axis=(-2, -1))))
+        ndim = regionmask.ndim
+        if ndim < 2:
+            return float("nan")
 
+        spacing_arr: Optional[np.ndarray] = None
         if spacing is not None:
-            # Calculate physical area accounting for pixel spacing
-            pixel_area = np.abs(np.prod(spacing[-2:]))
-            return pixel_count * pixel_area
+            spacing_arr = np.abs(np.asarray(spacing[:ndim], dtype=np.float64))
 
-        return pixel_count
+        if ndim == 2:
+            pixel_count = float(np.sum(regionmask))
+            if spacing_arr is not None and spacing_arr.size > 1:
+                pixel_count *= float(np.abs(spacing_arr[0] * spacing_arr[1]))
+            return pixel_count
+
+        areas: List[float] = []
+        for axis_i, axis_j in RegionAnalyzer.cross_sectional_area_plane_indices(ndim):
+            plane_axes = (axis_i, axis_j)
+            projected = np.sum(regionmask, axis=plane_axes)
+            pixel_count = float(np.max(projected))
+            if spacing_arr is not None and spacing_arr.size > axis_j:
+                pixel_count *= float(np.abs(spacing_arr[axis_i] * spacing_arr[axis_j]))
+            areas.append(pixel_count)
+        return tuple(areas)
 
     @staticmethod
     def volume(regionmask, intensity_image=None, spacing=None):
@@ -334,31 +978,42 @@ class RegionAnalyzer(StackProcessor):
             Volume as a float. If spacing is provided, returns physical volume.
             Otherwise, returns number of pixels/voxels.
         """
+        if regionmask.ndim == 2:
+            return float("nan")
+
         pixel_count = float(np.sum(regionmask))
 
         if spacing is not None:
-            # Calculate physical volume accounting for voxel spacing
-            voxel_volume = np.abs(np.prod(spacing))
+            spacing_arr = np.abs(np.asarray(spacing[: regionmask.ndim], dtype=np.float64))
+            voxel_volume = float(np.prod(spacing_arr))
             return pixel_count * voxel_volume
 
         return pixel_count
 
     def _process_slice(
-        self, labels: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
+        self,
+        labels: np.ndarray,
+        slice_annotations: Optional[dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        stack_id: Optional[str] = None,
+        **kwargs,
     ) -> List["RegionProperties"] | pd.DataFrame:
-        """Process a single slice to extract region properties.
+        """Process one label slice and return region measurements.
 
         Args:
-            labels: Labeled array slice.
-            metadata: Optional metadata to pass to the processor.
-            **kwargs: Additional keyword arguments to pass to the processor.
+            labels: Labeled array for one iterator step (2D plane or ND sub-volume).
+            slice_annotations: Optional axis→index map from the stack iterator.
+            metadata: Optional stack metadata; ``scale`` sets spacing, ``axes``
+                drives ``map_axes`` renaming. Safe to pass ``None``.
+            stack_id: Optional stack identifier; a new id is generated if omitted.
+            **kwargs: Forwarded from :class:`StackProcessor` (ignored here).
 
         Returns:
-            Either a list of RegionProperties or a pandas DataFrame, depending
-            on output_type configuration.
+            List of :class:`RegionProperties` or a DataFrame indexed by ``label``,
+            depending on :attr:`RegionAnalyzerConfig.output_type`.
 
         Raises:
-            ValueError: If output_type is invalid.
+            ValueError: If ``output_type`` is not ``list`` or ``dataframe``.
         """
         if metadata is None or metadata.get("scale", None) is None:
             spacing = None
@@ -367,7 +1022,11 @@ class RegionAnalyzer(StackProcessor):
         if spacing is not None:
             spacing = spacing[-labels.ndim :]
         debug_mask_labels("RegionAnalyzer._process_slice", labels)
-        logger.info(f"RegionAnalyzer: Applying scale: {spacing}")
+        channel_names = metadata.get("channel_names") if metadata else None
+        logger.info(
+            f"RegionAnalyzer: Applying scale: {spacing}, labels.shape={labels.shape}, "
+            f"channel_names={channel_names}"
+        )
 
         # Get extra_properties functions with spacing wrapped in
         extra_props_funcs = self.used_extra_properties_funcs(spacing=spacing)
@@ -375,6 +1034,9 @@ class RegionAnalyzer(StackProcessor):
         if self.config.output_type == "list":
             results = regionprops(
                 labels, extra_properties=extra_props_funcs, spacing=spacing
+            )
+            results = self._expand_mapped_property_attributes(
+                results, labels.ndim, metadata
             )
         elif self.config.output_type == "dataframe":
             results = pd.DataFrame(
@@ -385,10 +1047,24 @@ class RegionAnalyzer(StackProcessor):
                     spacing=spacing,
                 )
             ).set_index("label")
+            if self.config.map_axes:
+                slice_axes = self._slice_axis_labels(labels.ndim, metadata)
+                results = self.map_dataframe_axis_columns(results, slice_axes)
         else:
             raise ValueError(
                 f"Invalid output type: {self.config.output_type}. Allowed output types are: list, dataframe"
             )
+
+        results = self._relabel_area_as_volume(results, labels.ndim)
+        results = self._ensure_positive_extent_values(results)
+
+        stack_id = stack_id or self.new_stack_id()
+        slice_id = self.new_slice_id()
+        results = self._assign_object_ids(results)
+        results = self._assign_stack_and_slice_ids(results, stack_id, slice_id)
+
+        if slice_annotations:
+            results = self._assign_slice_annotations(results, slice_annotations)
 
         if isinstance(results, list):
             logger.debug(
@@ -428,103 +1104,154 @@ class RegionAnalyzer(StackProcessor):
     def run(
         self,
         labels: np.ndarray,
-        workers: int = -1,
-        verbose: int = 10,
         metadata: Optional[dict[str, Any]] = None,
         **kwargs,
     ) -> List["RegionProperties"] | pd.DataFrame:
-        """Run the region analyzer on a labeled array.
+        """Analyze labeled regions over the stack iterator.
 
         Args:
-            labels: Labeled array to analyze.
-            workers: Number of parallel workers (-1 for all cores).
-            verbose: Verbosity level for parallel processing.
+            labels: Labeled array (any dimensionality supported by the iterator).
+            metadata: Optional stack metadata (spacing, axes, etc.). May be ``None``.
+            **kwargs: Passed to :class:`StackProcessor` (``workers``, ``verbose``,
+                optional ``stack_id``).
 
         Returns:
-            Region properties as list or DataFrame, depending on output_type.
+            Region properties as a list or DataFrame per ``output_type``.
         """
         logger.debug("DEBUG: entered RegionAnalyzer.run")
         logger.debug("DEBUG: labels shape =", getattr(labels, "shape", None))
-        debug_mask_labels("RegionAnalyzer.run", labels)
-        results = super().run(
-            labels, workers=workers, verbose=verbose, metadata=metadata, **kwargs
+        # debug_mask_labels("RegionAnalyzer.run", labels)
+        stack_id = kwargs.pop("stack_id", None) or self.new_stack_id()
+        results, _ = super().run(
+            labels, metadata=metadata, stack_id=stack_id, **kwargs
         )
         logger.debug(f"RegionAnalyzer.run(): Results = {results}")
-        return results[0]
+        return results
 
 
 class RegionAnalyzerConfig(StackProcessorConfig):
-    """Configuration for region analysis operations.
+    """Configuration for :class:`RegionAnalyzer`.
+
+    Inherits stack iteration settings from :class:`~vistiq.core.StackProcessorConfig`
+    (``iterator_config``, ``batch_size``, ``preferred_backend``, etc.).
 
     Attributes:
-        output_type: Output format ("list" for RegionProperties list, "dataframe" for pandas DataFrame).
-        properties: List of property names to compute. "label" is always included.
+        output_type: ``"list"`` returns :class:`RegionProperties` objects (for
+            filtering and downstream Python code). ``"dataframe"`` returns a
+            pandas table indexed by ``label``.
+        properties: Names to compute. Built-in scikit-image properties, custom
+            extras (:meth:`RegionAnalyzer.extra_properties_funcs`), postcomputed
+            ``slice_annotations``, and mapped identifiers (``centroid-y``,
+            ``cross_sectional_area-xy``, ``bbox-end-z``, …) are accepted.
+            ``label``, ``object_id``, ``slice_id``, and ``stack_id`` are always
+            injected (:meth:`RegionAnalyzer.ensure_mandatory_properties`).
+        map_axes: When ``True`` and ``output_type="dataframe"``, apply
+            :meth:`RegionAnalyzer.map_dataframe_axis_columns` after
+            ``regionprops_table``. List output ignores this flag — list mapped
+            names via ``properties`` instead.
+        expand_coordinates: Reserved for future coordinate expansion; not
+            implemented yet.
+        iterator_config: :class:`~vistiq.utils.ArrayIteratorConfig` defining
+            ``slice_def``. ``None`` or ``()`` analyzes the whole volume.
+            Length-1 ``slice_def`` is invalid. Dimensionality also drives
+            automatic ``area``↔``volume`` and ``circularity``↔``sphericity``
+            substitution (:meth:`validate_properties_iterator`).
+
+    Note:
+        ``area``/``volume`` and ``circularity``/``sphericity`` are swapped
+        automatically when ``slice_def`` implies 2D vs 3D slice geometry.
     """
 
     output_type: Literal["list", "dataframe"] = "list"
-    properties: List[str] = RegionAnalyzer.default_properties
+    properties: List[str] = Field(
+        default_factory=lambda: list(RegionAnalyzer.default_properties)
+    )
+    map_axes: Optional[bool] = False
+    expand_coordinates: Optional[bool] = False
+
+    @field_validator("iterator_config")
+    @classmethod
+    def validate_iterator_config(cls, v: ArrayIteratorConfig) -> ArrayIteratorConfig:
+        """Validate ``slice_def``: ``None``, ``()`` (whole volume), or length >= 2."""
+        slice_def = v.slice_def
+        if slice_def is None or len(slice_def) == 0:
+            return v
+        if len(slice_def) == 1:
+            raise ValueError(
+                "iterator_config.slice_def must be None, empty () for whole-volume "
+                "analysis, or keep at least two axes; "
+                f"got {slice_def!r} (length 1)"
+            )
+        return v
 
     @field_validator("properties")
     @classmethod
     def validate_properties(cls, v: List[str]) -> List[str]:
-        """Validate that all properties are allowed and include "label".
+        """Validate property names and ensure mandatory outputs are present.
 
         Args:
             v: List of property names to validate.
 
         Returns:
-            Validated list with "label" added if missing.
+            Validated list including mandatory properties.
 
         Raises:
             ValueError: If any property is not in the allowed list.
         """
         if v is None or len(v) == 0:
-            return RegionAnalyzer.default_properties
-        elif not set(v).issubset(set(RegionAnalyzer.allowed_properties())):
-            raise ValueError(
-                f"One or more invalid properties: {v}. Allowed properties are: {RegionAnalyzer.allowed_properties()}"
-            )
-        if "label" not in v:
-            v = ["label"] + v
-        return v
+            v = list(RegionAnalyzer.default_properties)
+        else:
+            invalid = [
+                prop
+                for prop in v
+                if not RegionAnalyzer.is_allowed_property_name(prop)
+            ]
+            if invalid:
+                raise ValueError(
+                    f"One or more invalid properties: {invalid}. "
+                    f"Use names from {RegionAnalyzer.allowed_properties()} "
+                    f"or mapped axis columns (e.g. 'cross_sectional_area-xy')."
+                )
+        return RegionAnalyzer.ensure_mandatory_properties(v)
 
     @model_validator(mode="after")
     def validate_properties_iterator(self) -> "RegionAnalyzerConfig":
-        """Validate properties based on iterator configuration.
+        """Adjust area/volume and circularity/sphericity for slice dimensionality.
 
-        Ensures mutually exclusive properties are handled correctly:
-        - "area" and "volume": If iterator_config.slice_def has length < 3: use "area", otherwise use "volume"
-        - "circularity" and "sphericity": If iterator_config.slice_def has length < 3: use "circularity", otherwise use "sphericity"
+        When ``slice_def`` spans three or more axes, ``area`` is replaced by
+        ``volume`` and ``circularity`` by ``sphericity`` (and vice versa for
+        lower-dimensional slices). Whole-volume analysis (``slice_def=()``) is
+        handled at runtime in :meth:`RegionAnalyzer._relabel_area_as_volume`
+        based on the actual label slice dimensionality.
 
         Returns:
             Validated configuration.
         """
-        if self.properties is None or len(self.properties) == 0:
-            self.properties = RegionAnalyzer.default_properties
+        props = (
+            list(self.properties)
+            if self.properties
+            else list(RegionAnalyzer.default_properties)
+        )
 
-        # Check if both "area" and "volume" are present
-        has_area = "area" in self.properties
-        has_volume = "volume" in self.properties
+        has_area = "area" in props
+        has_volume = "volume" in props
+        slice_def = self.iterator_config.slice_def
+        slice_def_len = len(slice_def) if slice_def is not None else 0
 
-        slice_def_len = len(self.iterator_config.slice_def)
-
-        # Handle area/volume mutual exclusivity
         if has_area and slice_def_len >= 3:
-            self.properties = [p for p in self.properties if p != "area"] + ["volume"]
+            props = [p for p in props if p != "area"] + ["volume"]
         if has_volume and slice_def_len < 3:
-            self.properties = [p for p in self.properties if p != "volume"] + ["area"]
+            props = [p for p in props if p != "volume"] + ["area"]
 
-        # Handle circularity/sphericity mutual exclusivity
-        has_circularity = "circularity" in self.properties
-        has_sphericity = "sphericity" in self.properties
+        has_circularity = "circularity" in props
+        has_sphericity = "sphericity" in props
 
         if has_circularity and slice_def_len >= 3:
-            self.properties = [p for p in self.properties if p != "circularity"] + [
-                "sphericity"
-            ]
+            props = [p for p in props if p != "circularity"] + ["sphericity"]
         if has_sphericity and slice_def_len < 3:
-            self.properties = [p for p in self.properties if p != "sphericity"] + [
-                "circularity"
-            ]
+            props = [p for p in props if p != "sphericity"] + ["circularity"]
 
+        props = RegionAnalyzer.ensure_mandatory_properties(props)
+        if props != self.properties:
+            object.__setattr__(self, "properties", props)
         return self

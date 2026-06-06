@@ -13,7 +13,7 @@ from bioio import BioImage
 from vistiq.core import Configuration, Configurable
 from prefect import task
 from vistiq.utils import find_matching_file_pairs, collect_all_files
-from pydantic import Field, PositiveInt, field_validator, ValidationInfo, model_validator
+from pydantic import Field, PositiveInt, field_validator, model_validator
 from bioio_ome_tiff.writers import OmeTiffWriter
 
 logger = logging.getLogger(__name__)
