@@ -523,5 +523,14 @@ class CoincidenceDetector(StackProcessor):
             stack_names = ("stack_1", "stack_2",)        
 
         results = super().run(labels1, labels2, stack_names, metadata=metadata, **kwargs)
-        consolidated_dfs = self._consolidate_results(results, stack_names)
-        return results, consolidated_dfs
+
+        # Flatten slice-level results: List[List[Dict]] -> List[Dict]
+        flat_results = []
+        for item in results:
+            if isinstance(item, list):
+                flat_results.extend(item)
+            else:
+                flat_results.append(item)
+
+        consolidated_dfs = self._consolidate_results(flat_results, stack_names)
+        return flat_results, consolidated_dfs

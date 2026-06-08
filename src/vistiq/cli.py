@@ -1687,6 +1687,12 @@ def run_enrich(config: CLIEnrichConfig) -> None:
     for item in file_list:
         path = Path(item).resolve()
         if path.is_file():
+            if path.suffix.lower() != ".csv":
+                logger.info("Skipping non-CSV file for enrich: %s", path)
+                continue
+            if not path.name.startswith("Features_"):
+                logger.info("Skipping non-Features CSV for enrich: %s", path)
+                continue
             targets.append(path)
         else:
             targets.extend(sorted(path.rglob("Features_*.csv")))
