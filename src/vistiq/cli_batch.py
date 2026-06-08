@@ -14,6 +14,7 @@ import pandas as pd
 from vistiq.analysis.coincidence import (
     CoincidenceDetector,
     CoincidenceDetectorConfig,
+    coincidence_display_name,
     merge_coincidence_into_features,
 )
 from vistiq.analysis.enrichment import (
@@ -32,10 +33,15 @@ def sanitize_channel_name(name: str) -> str:
     return re.sub(r"[^\w\-.]+", "_", name.strip()) or "Ch0"
 
 
+def canonical_channel_name(name: str) -> str:
+    """Normalize channel names for filenames and cross-file matching."""
+    return coincidence_display_name(sanitize_channel_name(name))
+
+
 def channel_name_from_stem(stem: str, prefix: str) -> Optional[str]:
     token = f"{prefix}_"
     if stem.startswith(token):
-        return sanitize_channel_name(stem[len(token) :])
+        return canonical_channel_name(stem[len(token) :])
     return None
 
 
@@ -46,10 +52,10 @@ def iter_channels(
     ch_names = list(metadata.get("channel_names") or [])
     if ch_axis is not None and img.ndim >= 4:
         for i, raw_name in enumerate(ch_names):
-            yield sanitize_channel_name(raw_name), np.take(img, i, axis=ch_axis)
+            yield canonical_channel_name(raw_name), np.take(img, i, axis=ch_axis)
         return
     if img.ndim == 3:
-        name = sanitize_channel_name(ch_names[0] if ch_names else "Ch0")
+        name = canonical_channel_name(ch_names[0] if ch_names else "Ch0")
         yield name, img
         return
     raise ValueError(f"Cannot split channels for image shape {img.shape}")
@@ -225,7 +231,7 @@ def run_coincidence_on_directory(
             logger.info("Wrote %s", out_csv)
 
     merged_coincidence = {
-        stack: _merge_coincidence_frames(frames)
+        canonical_channel_name(stack): _merge_coincidence_frames(frames)
         for stack, frames in coincidence_by_stack.items()
         if frames
     }
@@ -236,13 +242,28 @@ def run_coincidence_on_directory(
         return
 
     feature_dfs = {
-        ch: pd.read_csv(path) for ch, path in feature_paths.items() if ch in merged_coincidence
+        canonical_channel_name(ch): pd.read_csv(path)
+        for ch, path in feature_paths.items()
+        if canonical_channel_name(ch) in merged_coincidence
     }
     if not feature_dfs:
+        logger.warning(
+            "No feature CSVs matched coincidence stacks in %s "
+            "(feature channels=%s, coincidence stacks=%s)",
+            work_dir,
+            sorted(feature_paths.keys()),
+            sorted(merged_coincidence.keys()),
+        )
         return
 
     merged_features = merge_coincidence_into_features(feature_dfs, merged_coincidence)
+    path_by_canonical = {
+        canonical_channel_name(ch): path for ch, path in feature_paths.items()
+    }
     for ch, df in merged_features.items():
-        out_path = feature_paths[ch]
+        out_path = path_by_canonical.get(ch)
+        if out_path is None:
+            logger.warning("No Features CSV path for channel %s; skipping write", ch)
+            continue
         df.to_csv(out_path, index=False)
         logger.info("Updated %s with coincidence columns", out_path)
