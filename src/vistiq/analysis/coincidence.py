@@ -524,11 +524,17 @@ class CoincidenceDetector(StackProcessor):
 
         results = super().run(labels1, labels2, stack_names, metadata=metadata, **kwargs)
 
+        print("raw results type:", type(results))
+        print("raw results len:", len(results) if results is not None else None)
+        print("first 10 item types:", [type(x) for x in results[:10]])
+        print("none count:", sum(x is None for x in results))
         # Flatten slice-level results: List[List[Dict]] -> List[Dict]
         flat_results = []
-        for item in results:
+        for item in results or []:
+            if item is None:
+                continue
             if isinstance(item, list):
-                flat_results.extend(item)
+                flat_results.extend(x for x in item if x is not None)
             else:
                 flat_results.append(item)
 
