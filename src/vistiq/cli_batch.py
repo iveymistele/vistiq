@@ -11,7 +11,11 @@ from typing import Any, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from vistiq.analysis.coincidence import CoincidenceDetector, CoincidenceDetectorConfig
+from vistiq.analysis.coincidence import (
+    CoincidenceDetector,
+    CoincidenceDetectorConfig,
+    merge_coincidence_into_features,
+)
 from vistiq.analysis.enrichment import (
     RegionDataFrameEnricher,
     RegionDataFrameEnrichmentConfig,
@@ -160,6 +164,25 @@ def collect_label_volumes(search_root: Path) -> dict[Path, dict[str, Path]]:
     return grouped
 
 
+def collect_feature_csvs(work_dir: Path) -> dict[str, Path]:
+    """Map channel name -> Features_<channel>.csv under work_dir."""
+    feature_map: dict[str, Path] = {}
+    for path in sorted(work_dir.glob("Features_*.csv")):
+        channel = channel_name_from_stem(path.stem, "Features")
+        if channel is not None:
+            feature_map[channel] = path
+    return feature_map
+
+
+def _merge_coincidence_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    merged = frames[0].copy()
+    for frame in frames[1:]:
+        merged = merged.join(frame, how="outer")
+    return merged
+
+
 def run_coincidence_on_directory(
     work_dir: Path,
     *,
@@ -191,9 +214,35 @@ def run_coincidence_on_directory(
         data, _meta = load_image(label_map[ch], squeeze=True)
         arrays[ch] = data
 
+    coincidence_by_stack: dict[str, list[pd.DataFrame]] = {ch: [] for ch in channels}
+
     for ch_a, ch_b in itertools.combinations(channels, 2):
         _, dfs = detector.run(arrays[ch_a], arrays[ch_b], stack_names=(ch_a, ch_b))
         for key, frame in dfs.items():
+            coincidence_by_stack[key].append(frame)
             out_csv = work_dir / f"Coincidence_{key}_{ch_a}_vs_{ch_b}.csv"
             frame.to_csv(out_csv, index=True)
             logger.info("Wrote %s", out_csv)
+
+    merged_coincidence = {
+        stack: _merge_coincidence_frames(frames)
+        for stack, frames in coincidence_by_stack.items()
+        if frames
+    }
+
+    feature_paths = collect_feature_csvs(work_dir)
+    if not feature_paths:
+        logger.warning("No Features_*.csv found in %s; skipping feature merge", work_dir)
+        return
+
+    feature_dfs = {
+        ch: pd.read_csv(path) for ch, path in feature_paths.items() if ch in merged_coincidence
+    }
+    if not feature_dfs:
+        return
+
+    merged_features = merge_coincidence_into_features(feature_dfs, merged_coincidence)
+    for ch, df in merged_features.items():
+        out_path = feature_paths[ch]
+        df.to_csv(out_path, index=False)
+        logger.info("Updated %s with coincidence columns", out_path)

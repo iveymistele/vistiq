@@ -11,6 +11,56 @@ from vistiq.utils import ArrayIterator, ArrayIteratorConfig, create_unique_folde
 
 logger = logging.getLogger(__name__)
 
+
+def coincidence_display_name(stack_name: str) -> str:
+    """Return a cleaner column label for duplicated stack names like ``Blue.Blue``."""
+    if "." in stack_name:
+        left, right = stack_name.split(".", 1)
+        if left == right:
+            return left
+    return stack_name
+
+
+def merge_coincidence_into_features(
+    feature_dfs: Dict[str, pd.DataFrame],
+    coincidence_dfs: Dict[str, pd.DataFrame],
+) -> Dict[str, pd.DataFrame]:
+    """Merge consolidated coincidence columns into feature tables keyed by stack name."""
+    merged: Dict[str, pd.DataFrame] = {}
+
+    for stack_name, features in feature_dfs.items():
+        out = features.copy()
+        if "label" not in out.columns:
+            if getattr(out.index, "name", None) == "label":
+                out = out.reset_index()
+            elif out.index.name is None:
+                out = out.reset_index(names="label")
+
+        coin = coincidence_dfs.get(stack_name)
+        if coin is None or coin.empty:
+            merged[stack_name] = out
+            continue
+
+        coin = coin.copy()
+        if "label" not in coin.columns:
+            coin = coin.reset_index(names="label")
+
+        coin_cols = [col for col in coin.columns if col != "label"]
+        combined = out.merge(coin, on="label", how="left")
+
+        for col in coin_cols:
+            if col not in combined.columns:
+                continue
+            if col.endswith(" +"):
+                combined[col] = combined[col].fillna(False).astype(bool)
+            else:
+                combined[col] = combined[col].fillna(0.0)
+
+        merged[stack_name] = combined
+
+    return merged
+
+
 class CoincidenceDetectorConfig(StackProcessorConfig):
     """Configuration for coincidence detection workflow.
     
@@ -439,7 +489,11 @@ class CoincidenceDetector(StackProcessor):
         
         return results
 
-    def _consolidate_results(self, results: List[Dict], stack_names: Tuple[str, str] = ["stack_1", "stack_2"]) -> Dict[str, pd.DataFrame]:
+    def _consolidate_results(
+        self,
+        results: List[Dict],
+        stack_names: Tuple[str, str] = ("stack_1", "stack_2"),
+    ) -> Dict[str, pd.DataFrame]:
         """Consolidate the results of the coincidence detector.
         
         Groups results by stack name and label, determining if any overlap for each
@@ -473,6 +527,8 @@ class CoincidenceDetector(StackProcessor):
         
         # Group results by stack and label, collecting both scores and booleans
         for result in results:
+            if result is None:
+                continue
             label1 = result[stack_names[0]]
             label2 = result[stack_names[1]]
             score = result["score"]
@@ -493,12 +549,13 @@ class CoincidenceDetector(StackProcessor):
         # Build separate DataFrames for each stack
         dataframes = {}
         for stack_name, comp_stack_name in zip(stack_names, stack_names[::-1]):
+            other_name = coincidence_display_name(comp_stack_name)
             rows = []
             for label, data in temp_consolidated[stack_name].items():
                 rows.append({
                     "label": label,
-                    f"{comp_stack_name} +": any(data["bools"]),
-                    f"{self.config.method} {comp_stack_name} +": max(data["scores"]) if data["scores"] else 0.0
+                    f"{other_name} +": any(data["bools"]),
+                    f"{self.config.method} {other_name} +": max(data["scores"]) if data["scores"] else 0.0
                 })
             dataframes[stack_name] = pd.DataFrame(rows).set_index("label")
         
@@ -520,16 +577,13 @@ class CoincidenceDetector(StackProcessor):
               with columns: label, above_threshold, max_score
         """
         if stack_names is None or len(stack_names) != 2:
-            stack_names = ("stack_1", "stack_2",)        
+            stack_names = ("stack_1", "stack_2")
+        else:
+            stack_names = tuple(stack_names)
 
         results = super().run(labels1, labels2, stack_names, metadata=metadata, **kwargs)
 
-        print("raw results type:", type(results))
-        print("raw results len:", len(results) if results is not None else None)
-        print("first 10 item types:", [type(x) for x in results[:10]])
-        print("none count:", sum(x is None for x in results))
-        # Flatten slice-level results: List[List[Dict]] -> List[Dict]
-        flat_results = []
+        flat_results: List[Dict] = []
         for item in results or []:
             if item is None:
                 continue
