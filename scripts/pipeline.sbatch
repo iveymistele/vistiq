@@ -10,11 +10,15 @@
 
 set -euo pipefail
 
-# One-shot chained pipeline (like legacy analyze.sbatch), still pure vistiq CLI:
+# One-shot chained pipeline (like legacy analyze.sh), still pure vistiq CLI:
 #   DoG -> MicroSAM -> enrich -> coincidence
 #
 # Usage:
 #   sbatch --array=1-3 scripts/pipeline.sbatch lif_pilot.txt /path/to/jobrun
+#
+# Scrib488/Dpn555/EdU647 fly-brain batch (pilot or full folder):
+#   bash scripts/submit-scrib-pipeline.sh pilot /scratch/.../Animal-1-scrib-dpn-edu.lif
+#   bash scripts/submit-scrib-pipeline.sh batch   # needs SCRIB_RAW_DIR + JOBRUN_ROOT
 
 # Check if file list is provided
 if [[ $# -lt 1 ]]; then
@@ -92,7 +96,9 @@ echo "Output:  $output_dir"
 
 module purge
 module load miniforge
-source activate /standard/vol191/siegristlab/software/vistiq-env-gpu # replace with your own environment path
+VISTIQ_ENV="${VISTIQ_ENV:-/standard/vol191/siegristlab/software/vistiq-env-gpu}"
+# shellcheck disable=SC1091
+source activate "$VISTIQ_ENV"
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Run vistiq pipeline on the selected file

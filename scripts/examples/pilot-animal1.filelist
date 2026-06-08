@@ -1,0 +1,15 @@
+# AkhGal4 x OR Susie / Scrib488 Dpn555 EdU 647 — Animal 1 pilot
+#
+# Source on /standard:
+#   /standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/Animal-1-scrib-dpn-edu.lif
+#
+# Recommended: copy to scratch, then submit:
+#   mkdir -p /scratch/zyh4up/batch-test/input
+#   cp "/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/Animal-1-scrib-dpn-edu.lif" \
+#      /scratch/zyh4up/batch-test/input/
+#   bash scripts/submit-scrib-pipeline.sh pilot /scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
+#
+# Or submit directly from /standard (no copy):
+#   sbatch --array=1-1 scripts/pipeline.sbatch scripts/examples/pilot-animal1.filelist /scratch/zyh4up/batch-test/output
+#
+'/scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif' 'pilot-animal1'

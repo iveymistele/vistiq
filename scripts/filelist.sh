@@ -4,14 +4,19 @@ set -e
 
 # Check if input and output paths are provided
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <input_path> <output_path>"
-    echo "  input_path:  Directory to search recursively for .lif files"
+    echo "Usage: $0 <input_path> <output_path> [glob_pattern]"
+    echo "  input_path:   Directory to search recursively for .lif files"
     echo "  output_path:  File to write two columns: absolute_path relative_path"
+    echo "  glob_pattern: Optional find -name pattern (default: *.lif)"
+    echo ""
+    echo "Example (Scrib/Dpn/EdU batch):"
+    echo "  $0 '/path/Scrib488 Dpn555 EdU 647/Raw files' scrib.filelist 'Animal-*-scrib-dpn-edu.lif'"
     exit 1
 fi
 
 input_path="$1"
 output_path="$2"
+glob_pattern="${3:-*.lif}"
 
 # Check if input path exists
 if [[ ! -e "$input_path" ]]; then
@@ -28,7 +33,7 @@ abs_input_path="$(cd "$input_path" && pwd)"
 temp_file=$(mktemp)
 trap "rm -f '$temp_file'" EXIT
 
-find "$abs_input_path" -type f -name "*.lif" > "$temp_file"
+find "$abs_input_path" -type f -name "$glob_pattern" | sort > "$temp_file"
 
 # Process each file to compute relative path
 # Initialize output file (truncate if exists)
