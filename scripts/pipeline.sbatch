@@ -97,8 +97,15 @@ echo "Output:  $output_dir"
 module purge
 module load miniforge
 VISTIQ_ENV="${VISTIQ_ENV:-/standard/vol191/siegristlab/software/vistiq-env-gpu}"
-eval "$(conda shell.bash hook)"
-conda activate "$VISTIQ_ENV"
+# UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
+# `conda activate` (including `eval "$(conda shell.bash hook)"`). Use the env directly.
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
+export CONDA_SHLVL=0
+export PATH="${VISTIQ_ENV}/bin:${PATH}"
+if ! command -v vistiq >/dev/null 2>&1; then
+    echo "Error: vistiq not found in ${VISTIQ_ENV}/bin (set VISTIQ_ENV to your conda env prefix)"
+    exit 1
+fi
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Run vistiq pipeline on the selected file
