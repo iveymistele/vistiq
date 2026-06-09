@@ -97,8 +97,8 @@ echo "Output:  $output_dir"
 module purge
 module load miniforge
 VISTIQ_ENV="${VISTIQ_ENV:-/standard/vol191/siegristlab/software/vistiq-env-gpu}"
-# shellcheck disable=SC1091
-source activate "$VISTIQ_ENV"
+eval "$(conda shell.bash hook)"
+conda activate "$VISTIQ_ENV"
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Run vistiq pipeline on the selected file
