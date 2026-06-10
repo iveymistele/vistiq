@@ -15,6 +15,7 @@ from .distance import (
     MatrixCalculator,
     MatrixCalculatorConfig,
 )
+from .matrix import MatrixAggregator, MatrixAggregatorConfig
 from .enrichment import (
     GridDensityFeaturesConfig,
     NeighborFeaturesConfig,
@@ -35,6 +36,8 @@ __all__ = [
     "DistanceCalculatorConfig",
     "MatrixCalculator",
     "MatrixCalculatorConfig",
+    "MatrixAggregator",
+    "MatrixAggregatorConfig",
     "RegionAnalyzer",
     "RegionAnalyzerConfig",
     "box_iou_batch_3d",

@@ -7,17 +7,9 @@ import torch
 from prefect import task
 from pydantic import model_validator
 
-from vistiq.constant.matrix import (
-    DIAGONAL,
-    FULL,
-    LOWER,
-    LOWER_ND,
-    OFF_DIAGONAL,
-    UPPER,
-    UPPER_ND,
-)
-from vistiq.core import Configurable, Configuration
-from vistiq.utils import convert_array_like, resolve_torch_device
+from vistiq.constant.matrix import FULL
+from vistiq.core import Configurable, Configuration, generate_name
+from vistiq.utils import convert_array_like, prepare_matrix_values, resolve_torch_device
 from vistiq.segment.analysis import (
     RegionAnalyzer,
     dataframe_to_numpy,
@@ -331,6 +323,7 @@ class MatrixFilter(Filter):
         mask[idx_cols] = True
         return mask
 
+    @task(name="MatrixFilter.run", task_run_name=generate_name)
     def run(
         self,
         data: Union[np.ndarray, "torch.Tensor", List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
@@ -363,39 +356,16 @@ class MatrixFilter(Filter):
             )
         return self.apply(values)
 
-    def _triangle_valid_mask(self, values: torch.Tensor) -> Optional[torch.Tensor]:
-        """Return a boolean mask of allowed triangle regions, or ``None`` if unrestricted."""
-        flags = self.config.triangle
-        if flags == FULL:
-            return None
-        if values.ndim != 2 or values.shape[0] != values.shape[1]:
-            return None
-
-        n = values.shape[0]
-        row_idx = torch.arange(n, device=values.device).unsqueeze(1)
-        col_idx = torch.arange(n, device=values.device).unsqueeze(0)
-
-        valid = torch.zeros((n, n), dtype=torch.bool, device=values.device)
-        if flags & DIAGONAL:
-            valid |= row_idx == col_idx
-        if flags & LOWER_ND:
-            valid |= row_idx > col_idx
-        if flags & UPPER_ND:
-            valid |= row_idx < col_idx
-        return valid
-
     def _prepare_values(
         self, values: torch.Tensor, exclude: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return *(masked values, validity mask)* for matrix selection."""
-        valid = torch.ones(values.shape, dtype=torch.bool, device=values.device)
-        if self.config.ignore_nan:
-            valid &= ~torch.isnan(values)
-        triangle_mask = self._triangle_valid_mask(values)
-        if triangle_mask is not None:
-            valid &= triangle_mask
-        prepared = torch.where(valid, values, exclude)
-        return prepared, valid
+        return prepare_matrix_values(
+            values,
+            exclude,
+            ignore_nan=self.config.ignore_nan,
+            triangle=self.config.triangle,
+        )
 
     @staticmethod
     def _filter_flat_indices(
@@ -599,86 +569,6 @@ class ValueFilter(MatrixFilter):
             return torch.where(passed)[0].detach().cpu().numpy().astype(np.int64)
         coords = torch.stack(torch.where(passed), dim=1)
         return coords.detach().cpu().numpy().astype(np.int64)
-
-class MatrixAggregatorConfig(MatrixFilterConfig):
-    """Configuration for :class:`MatrixAggregator`.
-
-    Attributes:
-        operation: One of ``"min"``, ``"max"``, ``"mean"``, ``"sum"``,
-            ``"median"``, or ``"count"``.
-        axis: Axis along which to aggregate (required).
-    """
-    operation: Literal["min", "max", "mean", "sum", "median", "count"] = "mean"
-    axis: Optional[int] = 0
-
-class MatrixAggregator(MatrixFilter):
-    """Aggregate values in a matrix along a specified axis."""
-
-    def __init__(self, config: MatrixAggregatorConfig):
-        super().__init__(config)
-
-    @classmethod
-    def from_config(cls, config: MatrixAggregatorConfig) -> "MatrixAggregator":
-        return cls(config)
-
-    def apply(self, values: torch.Tensor) -> torch.Tensor:
-        """Reduce *values* along :attr:`~MatrixAggregatorConfig.axis`."""
-        return self._aggregate(values)
-
-    def _resolve_axis(self, values: torch.Tensor) -> int:
-        axis = self.config.axis
-        if axis is None:
-            raise ValueError("MatrixAggregatorConfig.axis must be set")
-        if isinstance(axis, tuple):
-            raise ValueError(
-                f"MatrixAggregator does not support tuple axis {axis!r}"
-            )
-        if axis < 0:
-            axis += values.ndim
-        if axis < 0 or axis >= values.ndim:
-            raise ValueError(
-                f"axis {self.config.axis!r} is out of bounds for ndim={values.ndim}"
-            )
-        return axis
-
-    def _aggregate(self, values: torch.Tensor) -> torch.Tensor:
-        axis = self._resolve_axis(values)
-        operation = self.config.operation
-        zero = torch.zeros((), dtype=values.dtype, device=values.device)
-        nan = torch.tensor(float("nan"), dtype=values.dtype, device=values.device)
-
-        if operation == "count":
-            _, valid = self._prepare_values(values, zero)
-            return valid.sum(dim=axis)
-
-        if operation == "sum":
-            prepared, _ = self._prepare_values(values, zero)
-            return prepared.sum(dim=axis)
-
-        if operation == "mean":
-            prepared, valid = self._prepare_values(values, zero)
-            counts = valid.sum(dim=axis)
-            sums = prepared.sum(dim=axis)
-            return torch.where(counts > 0, sums / counts.to(values.dtype), nan)
-
-        if operation == "min":
-            fill = torch.full((), float("inf"), dtype=values.dtype, device=values.device)
-            prepared, valid = self._prepare_values(values, fill)
-            result = torch.min(prepared, dim=axis).values
-            return torch.where(valid.any(dim=axis), result, nan)
-
-        if operation == "max":
-            fill = torch.full((), float("-inf"), dtype=values.dtype, device=values.device)
-            prepared, valid = self._prepare_values(values, fill)
-            result = torch.max(prepared, dim=axis).values
-            return torch.where(valid.any(dim=axis), result, nan)
-
-        if operation == "median":
-            prepared, valid = self._prepare_values(values, nan)
-            result = torch.nanmedian(prepared, dim=axis).values
-            return torch.where(valid.any(dim=axis), result, nan)
-
-        raise ValueError(f"Invalid operation: {operation}")
 
 class MinFilterConfig(FilterConfig):
     """Configuration for :class:`MinFilter`.
