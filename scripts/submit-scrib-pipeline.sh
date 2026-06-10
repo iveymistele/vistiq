@@ -4,9 +4,10 @@
 # Runs the same analysis as legacy analyze.sh jobruns:
 #   DoG (sigma 1/12) -> MicroSAM (vit_l_lm) -> enrich -> coincidence (dice, 0.1, outline)
 #
-# Two modes:
+# Three modes:
 #   pilot  - one .lif copied to scratch (test before full batch)
 #   batch  - all Animal-*-scrib-dpn-edu.lif files under a Raw files folder
+#   rerun  - resubmit only selected array task IDs from a prior batch file list
 #
 # Pilot example (copy to scratch first, recommended):
 #   mkdir -p /scratch/zyh4up/batch-test/input
@@ -18,9 +19,14 @@
 #   bash scripts/submit-scrib-pipeline.sh pilot \
 #     /scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
 #
-# Full batch example (all Animal-*-scrib-dpn-edu.lif in Raw files):
-#   export SCRIB_DATASET_ROOT="/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647"
+# Full batch (all Animal-*-scrib-dpn-edu.lif in Raw files):
+#   export SLURM_ACCOUNT=siegristlab
 #   bash scripts/submit-scrib-pipeline.sh batch
+#
+# Rerun failed/cancelled array tasks only (after moving incomplete output aside):
+#   sacct -j <JOBID> --format=JobID,State -n | grep -E 'FAILED|CANCELLED|TIMEOUT'
+#   bash scripts/submit-scrib-pipeline.sh rerun 3,5,7
+#   bash scripts/submit-scrib-pipeline.sh rerun-failed <JOBID>
 #
 # After git pull on the cluster, reinstall once:
 #   pip install -e /path/to/vistiq
@@ -49,6 +55,13 @@ usage() {
 Usage:
   $0 pilot <path/to/Animal-1-scrib-dpn-edu.lif> [output_subdir]
   $0 batch
+  $0 rerun <array_spec> [filelist]
+  $0 rerun-failed <slurm_job_id> [filelist]
+
+  rerun examples:
+    $0 rerun 3,5,7
+    $0 rerun 3-5,8 /path/to/scrib-2026-06-08.filelist
+    $0 rerun-failed 12345678
 
 Environment variables:
   VISTIQ_SCRATCH   Scratch workspace (default: $VISTIQ_SCRATCH)
@@ -100,6 +113,13 @@ submit_job() {
     fi
     echo "-------------------------"
 
+    # Prefect 3 ephemeral server (503 under array load) — export before sbatch so --export=ALL passes them
+    export PREFECT_API_URL=
+    export PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
+    export PREFECT_LOGGING_TO_API_ENABLED=false
+    export PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW=ignore
+    export PREFECT_CLOUD_ENABLE_ORCHESTRATION_TELEMETRY=false
+
     local sbatch_args=(
         --export=ALL,VISTIQ_ENV="$VISTIQ_ENV"
         --array="$array_spec"
@@ -110,6 +130,39 @@ submit_job() {
     fi
 
     sbatch "${sbatch_args[@]}" "$PIPELINE_SBATCH" "$filelist" "$output_root"
+}
+
+resolve_batch_filelist() {
+    if [[ $# -ge 1 && -n "${1:-}" ]]; then
+        realpath "$1"
+        return
+    fi
+    local filelist_dir
+    filelist_dir="$(dirname "$JOBRUN_ROOT")/filelists"
+    local latest
+    latest="$(ls -t "$filelist_dir"/scrib-*.filelist 2>/dev/null | head -1 || true)"
+    if [[ -z "$latest" ]]; then
+        echo "Error: no scrib-*.filelist under $filelist_dir; pass filelist path" >&2
+        exit 1
+    fi
+    echo "$latest"
+}
+
+failed_array_spec_from_job() {
+    local job_id="$1"
+    local spec
+    spec="$(
+        sacct -j "$job_id" --format=JobID,State -n -P 2>/dev/null | awk -F'|' '
+            $2 ~ /^(FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL)$/ {
+                n = split($1, parts, "_")
+                if (n >= 2 && parts[2] != "" && parts[2] !~ /batch/) print parts[2]
+            }' | sort -n -u | paste -sd, -
+    )"
+    if [[ -z "$spec" ]]; then
+        echo "Error: no failed/cancelled array tasks found for job $job_id" >&2
+        exit 1
+    fi
+    echo "$spec"
 }
 
 case "$mode" in
@@ -154,8 +207,32 @@ case "$mode" in
         submit_job "$filelist" "$JOBRUN_ROOT" "1-$(wc -l < "$filelist" | tr -d ' ')"
         ;;
 
+    rerun)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: rerun mode requires array_spec (e.g. 3,5,7)"
+            usage
+            exit 1
+        fi
+        array_spec="$1"
+        filelist="$(resolve_batch_filelist "${2:-}")"
+        echo "Rerun array tasks: $array_spec"
+        submit_job "$filelist" "$JOBRUN_ROOT" "$array_spec"
+        ;;
+
+    rerun-failed)
+        if [[ $# -lt 1 ]]; then
+            echo "Error: rerun-failed mode requires SLURM job ID"
+            usage
+            exit 1
+        fi
+        array_spec="$(failed_array_spec_from_job "$1")"
+        filelist="$(resolve_batch_filelist "${2:-}")"
+        echo "Rerun failed/cancelled tasks from job $1: $array_spec"
+        submit_job "$filelist" "$JOBRUN_ROOT" "$array_spec"
+        ;;
+
     *)
-        echo "Error: unknown mode '$mode' (use pilot or batch)"
+        echo "Error: unknown mode '$mode' (use pilot, batch, rerun, or rerun-failed)"
         usage
         exit 1
         ;;
