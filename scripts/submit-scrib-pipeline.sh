@@ -39,7 +39,7 @@ PIPELINE_SBATCH="$SCRIPT_DIR/pipeline.sbatch"
 FILELIST_SH="$SCRIPT_DIR/filelist.sh"
 
 VISTIQ_SCRATCH="${VISTIQ_SCRATCH:-/scratch/zyh4up/batch-test}"
-VISTIQ_ENV="${VISTIQ_ENV:-/standard/vol191/siegristlab/software/vistiq-env-gpu}"
+VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_TIME="${SLURM_TIME:-6:00:00}"
 SCRIB_GLOB="${SCRIB_GLOB:-Animal-*-scrib-dpn-edu.lif}"
@@ -113,12 +113,8 @@ submit_job() {
     fi
     echo "-------------------------"
 
-    # Prefect 3 ephemeral server (503 under array load) — export before sbatch so --export=ALL passes them
-    export PREFECT_API_URL=
-    export PREFECT_SERVER_ALLOW_EPHEMERAL_MODE=false
-    export PREFECT_LOGGING_TO_API_ENABLED=false
-    export PREFECT_LOGGING_TO_API_WHEN_MISSING_FLOW=ignore
-    export PREFECT_CLOUD_ENABLE_ORCHESTRATION_TELEMETRY=false
+# Prefect runtime isolation is handled inside pipeline.sbatch, where SLURM_JOB_ID
+# and SLURM_ARRAY_TASK_ID are available.
 
     local sbatch_args=(
         --export=ALL,VISTIQ_ENV="$VISTIQ_ENV"

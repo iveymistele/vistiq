@@ -96,7 +96,7 @@ echo "Output:  $output_dir"
 
 module purge
 module load miniforge
-VISTIQ_ENV="${VISTIQ_ENV:-/standard/vol191/siegristlab/software/vistiq-env-gpu}"
+VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
 # UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
 # `conda activate` (including `eval "$(conda shell.bash hook)"`). Use the env directly.
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
@@ -107,6 +107,18 @@ if ! command -v vistiq >/dev/null 2>&1; then
     exit 1
 fi
 export QT_QPA_PLATFORM=offscreen # for napari headless
+
+# Isolate Prefect's local state per Slurm array task.
+# This avoids multiple array tasks sharing the same temporary Prefect DB/server state.
+export PREFECT_HOME="/scratch/$USER/prefect-${SLURM_JOB_ID:-$$}-${SLURM_ARRAY_TASK_ID:-0}"
+mkdir -p "$PREFECT_HOME"
+
+# Reduce Prefect API/logging chatter; logs still go to Slurm .err/.log files.
+unset PREFECT_API_URL
+export PREFECT_LOGGING_TO_API_ENABLED=false
+export PREFECT_CLOUD_ENABLE_ORCHESTRATION_TELEMETRY=false
+
+echo "Prefect home: $PREFECT_HOME"
 
 # Run vistiq pipeline on the selected file
 # Global options (--loglevel, --processes, --device) must come before the subcommand name
