@@ -7,6 +7,15 @@ import torch
 from prefect import task
 from pydantic import model_validator
 
+from vistiq.constant.matrix import (
+    DIAGONAL,
+    FULL,
+    LOWER,
+    LOWER_ND,
+    OFF_DIAGONAL,
+    UPPER,
+    UPPER_ND,
+)
 from vistiq.core import Configurable, Configuration
 from vistiq.utils import convert_array_like, resolve_torch_device
 from vistiq.segment.analysis import (
@@ -17,14 +26,6 @@ from vistiq.segment.analysis import (
 )
 
 logger = logging.getLogger(__name__)
-
-DIAGONAL = 1
-LOWER_ND = 2
-UPPER_ND = 4
-LOWER = DIAGONAL | LOWER_ND
-UPPER = DIAGONAL | UPPER_ND
-OFF_DIAGONAL = LOWER_ND | UPPER_ND
-FULL = DIAGONAL | LOWER_ND | UPPER_ND
 
 
 def _value_column_count(data: Union[np.ndarray, "torch.Tensor"]) -> int:

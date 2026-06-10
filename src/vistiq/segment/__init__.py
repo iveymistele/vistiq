@@ -28,7 +28,7 @@ from vistiq.segment.analysis import (
     region_to_numpy,
     regions_to_numpy,
 )
-from vistiq.segment.select import (
+from vistiq.constant.matrix import (
     DIAGONAL,
     FULL,
     LOWER,
@@ -36,6 +36,8 @@ from vistiq.segment.select import (
     OFF_DIAGONAL,
     UPPER,
     UPPER_ND,
+)
+from vistiq.segment.select import (
     Filter,
     FilterConfig,
     FilterOps,
