@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from vistiq.core import ArrayIteratorConfig
 from vistiq.preprocess import DoG, DoGConfig
-from vistiq.seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
+from vistiq.segment import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
 from vistiq.analysis import CoincidenceDetector, CoincidenceDetectorConfig
 from vistiq.utils import load_image, get_scenes
 from bioio_ome_tiff.writers import OmeTiffWriter

@@ -14,6 +14,7 @@ from typing import (
     Pattern,
     Any,
     Sequence,
+    Literal,
 )
 from collections import defaultdict
 
@@ -34,6 +35,56 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _numpy_to_torch(
+    arr: np.ndarray, device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """Convert a NumPy array to a tensor, using float32 for floating dtypes."""
+    arr = np.ascontiguousarray(arr)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float32, copy=False)
+    tensor = torch.from_numpy(arr)
+    return tensor.to(device) if device is not None else tensor
+
+
+def _torch_to_device(
+    tensor: torch.Tensor, device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """Move a tensor to *device*, downcasting float64 on MPS."""
+    if device is not None:
+        tensor = tensor.to(device)
+    target = device if device is not None else tensor.device
+    if (
+        target.type == "mps"
+        and tensor.is_floating_point()
+        and tensor.dtype == torch.float64
+    ):
+        tensor = tensor.to(torch.float32)
+    return tensor
+
+
+def convert_array_like(
+    arr: Union[np.ndarray, torch.Tensor, Sequence[float], float, int],
+    dtype: Literal["numpy", "torch.Tensor"] = "numpy",
+    device: Optional[Union[torch.device, str]] = None,
+) -> Union[np.ndarray, torch.Tensor]:
+    """Convert an array-like object to the requested dtype and device."""
+    if device is not None and isinstance(device, str):
+        if device in ("cuda", "mps", "cpu"):
+            device = resolve_preferred_device(device)  # type: ignore[arg-type]
+        else:
+            device = torch.device(device)
+    if isinstance(arr, torch.Tensor):
+        if dtype == "torch.Tensor":
+            return _torch_to_device(arr, device)
+        return arr.detach().cpu().numpy()
+
+    if not isinstance(arr, np.ndarray):
+        arr = np.asarray(arr)
+
+    if dtype == "torch.Tensor":
+        return _numpy_to_torch(arr, device)
+    return arr
 
 def resolve_futures(value: Any) -> Any:
     """Resolve Prefect futures/states into concrete values.
@@ -706,20 +757,6 @@ def _normalize_stack_names(
     )
 
 
-def _torch_imports(raise_on_error: bool = False) -> Any:
-    """Return the ``torch`` module or raise if PyTorch is unavailable."""
-    try:
-        import torch
-    except ImportError as exc:
-        if raise_on_error:
-            raise ImportError(
-                "PyTorch is not installed. No fallback functions available."
-                ) from exc
-        else:
-            logger.warning("PyTorch is not available, trying to use fallback functions")
-            return None
-    return torch
-
 
 def available_accelerator_devices() -> dict[str, list[dict[str, Any]]]:
     """Return available PyTorch GPU/accelerator backends and devices.
@@ -824,6 +861,56 @@ def check_device() -> torch.device:
 
     logger.info("Falling back to CPU device")
     return torch.device("cpu")
+
+
+def resolve_preferred_device(
+    preferred: Optional[Literal["cuda", "mps", "cpu"]] = None,
+) -> torch.device:
+    """Resolve a device preference to a concrete :class:`torch.device` at runtime.
+
+    ``None`` delegates to :func:`check_device`. Explicit backend names pick the
+    first available device for that backend, then fall back to
+    :func:`check_device` with a warning if unavailable.
+    """
+    if preferred is None:
+        return check_device()
+    if preferred == "cpu":
+        return torch.device("cpu")
+
+    accelerators = available_accelerator_devices()
+    entries = accelerators.get(preferred)
+    if entries:
+        return torch.device(entries[0]["torch_device"])
+
+    logger.warning(
+        "Preferred device %r unavailable; falling back via check_device()",
+        preferred,
+    )
+    return check_device()
+
+
+def resolve_torch_device(
+    device: Optional[Union[torch.device, str]] = None,
+    *,
+    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor",
+    preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None,
+) -> Optional[torch.device]:
+    """Resolve the torch device for array-backed calculations at runtime.
+
+    When *device* is set it takes precedence. Otherwise a device is resolved
+    only when *preferred_input_type* is ``"torch.Tensor"`` (via
+    *preferred_device* or :func:`check_device` when that is ``None``); numpy-backed
+    paths return ``None``.
+    """
+    if device is not None:
+        if isinstance(device, torch.device):
+            return device
+        if device in ("cuda", "mps", "cpu"):
+            return resolve_preferred_device(device)  # type: ignore[arg-type]
+        return torch.device(device)
+    if preferred_input_type != "torch.Tensor":
+        return None
+    return resolve_preferred_device(preferred_device)
 
 
 def set_fractional_memory(

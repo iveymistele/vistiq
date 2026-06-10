@@ -126,6 +126,9 @@ class BinaryProcessor(Configurable[BinaryProcessorConfig]):
     segmentation or region dilation.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: BinaryProcessorConfig):
         """Initialize the binary processor.
 

@@ -1,5 +1,5 @@
 import numpy as np
-from vistiq.seg import LabelRemoverConfig, LabelRemover
+from vistiq.segment import LabelRemoverConfig, LabelRemover
 
 def main():
     labels = np.array(

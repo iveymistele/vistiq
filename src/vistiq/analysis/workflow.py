@@ -4,7 +4,7 @@ import numpy as np
 from pydantic import Field
 
 from vistiq.analysis.coincidence import CoincidenceDetectorConfig
-from vistiq.analysis.distance import DistanceAnalyzerConfig
+from vistiq.analysis.distance import DistanceCalculatorConfig
 from vistiq.core import ArrayIteratorConfig, Configurable
 from vistiq.workflow import Workflow, WorkflowConfig
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
@@ -26,7 +26,7 @@ class AnalysisFlowConfig(WorkflowConfig):
         properties=["centroid"], 
         output_type="dataframe",
         iterator_config=ArrayIteratorConfig(slice_def=())))
-    distance_analyzer: Optional[DistanceAnalyzerConfig] = None
+    distance_calculator: Optional[DistanceCalculatorConfig] = None
     coincidence_detector: Optional[CoincidenceDetectorConfig] = None
 
 class AnalysisFlow(Workflow):
@@ -78,23 +78,23 @@ class AnalysisFlow(Workflow):
             properties = list(set(basecfg.properties + ["label", "object_id", "centroid"]))
             racfg = basecfg.model_copy(update={"properties": properties, "output_type": "dataframe"})
         else:
-            # create new config, region analyzer output is needed for distance analyzer
+            # create new config, region analyzer output is needed for distance calculator
             racfg = RegionAnalyzerConfig(properties=["label", "object_id", "centroid"], output_type="dataframe")
         ra = RegionAnalyzer(racfg)
         r_results = ra.run.map(labels, metadata=metadata) # can't use run.submit because we need to use the dataframe
         for meta, r_result in zip(metadata, r_results):
             results[f"region_analyzer: {meta['channel_names'][0]}"] = r_result
         """
-        if self.config.distance_analyzer is not None:
+        if self.config.distance_calculator is not None:
             # update config to add "centroid" to properties and set output type to dataframe
-            if self.config.distance_analyzer is not None:
-                da = Configurable.create_from_config(self.config.distance_analyzer)
+            if self.config.distance_calculator is not None:
+                dc = Configurable.create_from_config(self.config.distance_calculator)
                 centroid_cols = [c for c in region_df.columns if c.startswith("centroid")]
                 centroids = region_df[centroid_cols].values
                 if "object_id" in region_df.columns:
                     object_ids = region_df["object_id"].values
                 else:
                     object_ids = region_df.index.values
-                results["distance_analyzer"] = da.run.submit(centroids, centroids, point_annotations=tuple(object_ids, object_ids))
+                results["distance_calculator"] = dc.run.submit(centroids, centroids, point_annotations=tuple(object_ids, object_ids))
         """
         return resolve_futures(results)

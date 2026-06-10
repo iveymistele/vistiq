@@ -252,6 +252,9 @@ class SegmenterConfig(StackProcessorConfig):
 
 class Segmenter(StackProcessor):
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: SegmenterConfig):
         super().__init__(config)
 
@@ -319,6 +322,9 @@ class Merger(StackProcessor):
 
     Used as the optional ``merger`` step in :class:`SegmentationFlow`.
     """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
 
     def __init__(self, config: MergerConfig):
         """Initialize the merger.

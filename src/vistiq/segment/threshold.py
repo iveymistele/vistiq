@@ -156,6 +156,9 @@ class Thresholder(StackProcessor):
     Converts grayscale images to binary masks using various thresholding methods.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     @classmethod
     def from_config(cls, config: ThresholderConfig) -> "Thresholder":
         """Create a Thresholder instance from a configuration.

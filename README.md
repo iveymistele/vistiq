@@ -288,7 +288,7 @@ vistiq train \
 Vistiq can also be used programmatically in Python scripts or Jupyter notebooks:
 
 ```python
-from vistiq.seg import Segmenter, SegmenterConfig
+from vistiq.segment import Segmenter, SegmenterConfig
 from vistiq.preprocess import Preprocessor, PreprocessorConfig
 
 # Logging is automatically configured when importing vistiq modules

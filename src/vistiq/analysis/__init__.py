@@ -10,10 +10,10 @@ from .coincidence import (
     mask_iou_batch_3d_torch,
 )
 from .distance import (
-    DistanceAnalyzer,
-    DistanceAnalyzerConfig,
-    MatrixAnalyzer,
-    MatrixAnalyzerConfig,
+    DistanceCalculator,
+    DistanceCalculatorConfig,
+    MatrixCalculator,
+    MatrixCalculatorConfig,
 )
 from .enrichment import (
     GridDensityFeaturesConfig,
@@ -29,14 +29,12 @@ from .workflow import AnalysisFlow, AnalysisFlowConfig
 __all__ = [
     "AnalysisFlow",
     "AnalysisFlowConfig",
-    "AnalysisWorkflow",
-    "AnalysisWorkflowConfig",
     "CoincidenceDetector",
     "CoincidenceDetectorConfig",
-    "DistanceAnalyzer",
-    "DistanceAnalyzerConfig",
-    "MatrixAnalyzer",
-    "MatrixAnalyzerConfig",
+    "DistanceCalculator",
+    "DistanceCalculatorConfig",
+    "MatrixCalculator",
+    "MatrixCalculatorConfig",
     "RegionAnalyzer",
     "RegionAnalyzerConfig",
     "box_iou_batch_3d",

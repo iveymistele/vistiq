@@ -38,6 +38,9 @@ class Workflow(Configurable):
         config: Configuration model instance.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: WorkflowConfig):
         """Initialize the base class.
 
