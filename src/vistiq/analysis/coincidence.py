@@ -577,6 +577,32 @@ def labels_iou_batch_3d(
     return out
 
 
+def box_iou_batch_3d_torch(
+    boxes_true: np.typing.NDArray[np.number],
+    boxes_detection: np.typing.NDArray[np.number],
+    overlap_metric: Literal["iou", "ios", "dice"] = "iou",
+    device: Union[str, int, Any, None] = None,
+) -> np.ndarray[np.float32]:
+    """PyTorch-backed pairwise box overlap; returns a host NumPy matrix."""
+    from vistiq.analysis.overlap import (
+        BoxOverlapCalculatorConfig,
+        OverlapCalculator,
+        metrics_calculator_configs,
+    )
+
+    calc = OverlapCalculator(
+        BoxOverlapCalculatorConfig(
+            metrics_calculators=metrics_calculator_configs(
+                (overlap_metric.lower(),)
+            ),
+            preferred_input_type="torch.Tensor",
+            output_type="np.ndarray",
+        )
+    )
+    result = calc.run(boxes_true, boxes_detection, device=device)
+    return np.asarray(result, dtype=np.float32)
+
+
 def box_iou_batch_3d(
     boxes_true: np.typing.NDArray[np.number],
     boxes_detection: np.typing.NDArray[np.number],
