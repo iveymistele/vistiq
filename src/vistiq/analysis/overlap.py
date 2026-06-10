@@ -1,8 +1,27 @@
-"""Composable overlap calculators (IoU, IoS, Dice) for boxes, masks, and labels."""
+"""Composable overlap calculators (IoU, IoS, Dice) for boxes, masks, and labels.
+
+The pipeline is configured with preset subclasses of :class:`OverlapCalculatorConfig`
+(:class:`BoxOverlapCalculatorConfig`, :class:`MaskOverlapCalculatorConfig`,
+:class:`LabelOverlapCalculatorConfig`) that wire a compatible builder, area
+calculator, and intersection calculator. Array backend (NumPy vs PyTorch, device)
+is set on those child configs; all pipeline children must agree.
+
+For coincidence workflows, pass a :data:`RegionMap` per collection so each region
+is keyed by a globally unique ``object_id`` with optional ``label_id`` (label
+path) and ``bbox`` (box path or mask pruning). Build maps from
+:class:`RegionAnalyzer` tables via :func:`region_map_from_dataframe`. Label
+overlap requires the original label volumes—not region property DataFrames—as
+``a`` and ``b``.
+
+Runtime options on :meth:`OverlapCalculator.run` include ``spacing`` (physical
+voxel size aligned with array axes), ``region_map``, and optional
+``annotations`` for DataFrame row/column labels when ``annotate=True``.
+"""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Self, Sequence, Union
 
@@ -22,6 +41,228 @@ _LABELS_IOU_DENSE_PAIR_FRACTION = 1.01
 
 SpacingLike = Optional[Union[dict[str, float], tuple[float, ...], Sequence[float]]]
 
+Box6 = tuple[float, float, float, float, float, float]
+
+_DEFAULT_BBOX_COLS = (
+    "bbox-start-x",
+    "bbox-start-y",
+    "bbox-start-z",
+    "bbox-end-x",
+    "bbox-end-y",
+    "bbox-end-z",
+)
+
+
+@dataclass(frozen=True)
+class RegionSpec:
+    """One region entry in a :data:`RegionMap`.
+
+    The map key is the globally unique ``object_id`` (typically from
+    :class:`RegionAnalyzer`). ``label_id`` and ``bbox`` describe how to build
+    geometry for that object on its side of the comparison.
+
+    Attributes:
+        label_id: Integer label value in that side's label volume. Required for
+            :class:`LabelOverlapCalculatorConfig` when using ``region_map``.
+        bbox: Axis-aligned box ``(x_min, y_min, z_min, x_max, y_max, z_max)``
+            in voxel/index coordinates. Required for
+            :class:`BoxOverlapCalculatorConfig`; optional for mask intersection
+            pruning when ``prune_bboxes=True``.
+    """
+
+    label_id: Optional[int] = None
+    bbox: Optional[Box6 | Sequence[float]] = None
+
+
+RegionMap = Mapping[str, RegionSpec]
+
+
+@dataclass(frozen=True)
+class RegionBuildContext:
+    """Parsed :class:`RegionMap` for one overlap collection."""
+
+    object_ids: tuple[str, ...]
+    label_ids: tuple[int, ...]
+    boxes: Optional[np.ndarray]
+
+
+def _annotations_empty(
+    annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]],
+) -> bool:
+    if annotations is None:
+        return True
+    rows, cols = annotations
+    return len(rows) == 0 and len(cols) == 0
+
+
+def annotations_from_region_map(
+    region_map_a: RegionMap,
+    region_map_b: RegionMap,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(index_object_ids, column_object_ids)`` from map key order."""
+    return (tuple(region_map_a.keys()), tuple(region_map_b.keys()))
+
+
+def _resolve_output_annotations(
+    annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]],
+    region_map: Optional[tuple[RegionMap, RegionMap]],
+    *,
+    annotate: bool,
+) -> Optional[tuple[tuple[str, ...], tuple[str, ...]]]:
+    """Resolve DataFrame labels from *region_map* and optional *annotations*.
+
+    When ``annotate`` is False, annotations are ignored. When True and
+    *annotations* is missing, ``object_id`` keys from *region_map* are used.
+    Explicit *annotations* override those keys but must match region count.
+    """
+    if region_map is None or not annotate:
+        return None if region_map is not None and not annotate else annotations
+    default = annotations_from_region_map(region_map[0], region_map[1])
+    if _annotations_empty(annotations):
+        return default
+    rows, cols = annotations
+    expected_rows, expected_cols = default
+    if len(rows) != len(expected_rows) or len(cols) != len(expected_cols):
+        raise ValueError(
+            "annotations must match region_map size; "
+            f"got {len(rows)} x {len(cols)}, expected "
+            f"{len(expected_rows)} x {len(expected_cols)}"
+        )
+    return (tuple(str(value) for value in rows), tuple(str(value) for value in cols))
+
+
+def parse_region_map(
+    region_map: RegionMap,
+    *,
+    require_label_id: bool = False,
+    require_bbox: bool = False,
+) -> RegionBuildContext:
+    """Validate *region_map* and extract ordered ids and optional boxes."""
+    object_ids = tuple(region_map.keys())
+    if len(object_ids) != len(set(object_ids)):
+        raise ValueError("region_map contains duplicate object_id keys")
+
+    label_ids: list[int] = []
+    seen_label_ids: set[int] = set()
+    boxes: list[Sequence[float]] = []
+
+    for object_id in object_ids:
+        spec = region_map[object_id]
+        if require_label_id and spec.label_id is None:
+            raise ValueError(
+                f"region_map[{object_id!r}] is missing label_id"
+            )
+        if require_bbox and spec.bbox is None:
+            raise ValueError(f"region_map[{object_id!r}] is missing bbox")
+        if spec.label_id is not None:
+            if spec.label_id in seen_label_ids:
+                raise ValueError(
+                    f"region_map contains duplicate label_id {spec.label_id}"
+                )
+            seen_label_ids.add(spec.label_id)
+            label_ids.append(int(spec.label_id))
+        if spec.bbox is not None:
+            if len(spec.bbox) != 6:
+                raise ValueError(
+                    f"region_map[{object_id!r}].bbox must have length 6; "
+                    f"got {len(spec.bbox)}"
+                )
+            boxes.append(tuple(float(v) for v in spec.bbox))
+
+    boxes_arr: Optional[np.ndarray] = None
+    if boxes:
+        if len(boxes) != len(object_ids):
+            raise ValueError(
+                "region_map must include bbox for every entry or none at all"
+            )
+        boxes_arr = np.asarray(boxes, dtype=np.float32)
+
+    if require_label_id and len(label_ids) != len(object_ids):
+        raise ValueError("region_map must include label_id for every entry")
+
+    return RegionBuildContext(
+        object_ids=object_ids,
+        label_ids=tuple(label_ids),
+        boxes=boxes_arr,
+    )
+
+
+def region_map_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    object_id_col: str = "object_id",
+    label_col: str = "label",
+    bbox_cols: Sequence[str] = _DEFAULT_BBOX_COLS,
+) -> dict[str, RegionSpec]:
+    """Build a :data:`RegionMap` from a :class:`RegionAnalyzer` table.
+
+    Expects columns ``object_id``, ``label``, and optionally the six bbox
+    columns ``bbox-start-{x,y,z}`` / ``bbox-end-{x,y,z}``. Row order becomes
+    matrix row/column order when ``annotate=True`` and no custom annotations
+    are passed.
+
+    After :class:`RegionFilter`, call ``reset_index()`` so ``object_id`` is a
+    column rather than the index.
+
+    Args:
+        df: Region property table (e.g. ``l_accepted.reset_index()``).
+        object_id_col: Column holding unique object identifiers.
+        label_col: Column holding integer label ids in the label volume.
+        bbox_cols: Bbox column names; omitted bboxes are stored as ``None``.
+
+    Returns:
+        Mapping from ``object_id`` to :class:`RegionSpec`.
+    """
+    if object_id_col not in df.columns:
+        raise KeyError(
+            f"column {object_id_col!r} not found; available: {list(df.columns)}"
+        )
+    if label_col not in df.columns:
+        raise KeyError(
+            f"column {label_col!r} not found; available: {list(df.columns)}"
+        )
+    has_bbox = all(col in df.columns for col in bbox_cols)
+    region_map: dict[str, RegionSpec] = {}
+    for _, row in df.iterrows():
+        object_id = str(row[object_id_col])
+        if object_id in region_map:
+            raise ValueError(f"duplicate object_id {object_id!r} in dataframe")
+        bbox: Optional[Box6] = None
+        if has_bbox:
+            bbox = tuple(float(row[col]) for col in bbox_cols)  # type: ignore[assignment]
+        region_map[object_id] = RegionSpec(
+            label_id=int(row[label_col]),
+            bbox=bbox,
+        )
+    return region_map
+
+
+def masks_from_label_volume(
+    labels: np.ndarray,
+    region_map: RegionMap,
+) -> np.ndarray:
+    """Build ``(N, *spatial)`` bool stack from a label volume and region map."""
+    if labels.ndim not in (2, 3):
+        raise ValueError(
+            f"label volumes must be 2D or 3D; got ndim={labels.ndim}"
+        )
+    masks: list[np.ndarray] = []
+    for object_id, spec in region_map.items():
+        if spec.label_id is None:
+            raise ValueError(
+                f"region_map[{object_id!r}] is missing label_id"
+            )
+        masks.append(labels == spec.label_id)
+    if not masks:
+        return np.empty((0,) + labels.shape, dtype=bool)
+    return np.stack(masks, axis=0)
+
+
+def boxes_from_region_map(region_map: RegionMap) -> np.ndarray:
+    """Stack ``(N, 6)`` boxes from map values."""
+    ctx = parse_region_map(region_map, require_bbox=True)
+    assert ctx.boxes is not None
+    return ctx.boxes
 
 # ---------------------------------------------------------------------------
 # Primitives
@@ -341,7 +582,7 @@ def _divide_pairwise(
 class MatrixBuilderConfig(Configuration):
     """Shared settings for overlap input builders."""
 
-    preferred_input_type: Literal["numpy", "torch.Tensor"] = "numpy"
+    preferred_input_type: Literal["numpy", "torch.Tensor"] = "torch.Tensor"
     preferred_device: Optional[Literal["cuda", "mps", "cpu"]] = None
 
 
@@ -359,6 +600,7 @@ class MatrixBuilder(Configurable[MatrixBuilderConfig]):
         self,
         data: Any,
         *,
+        region_map: Optional[RegionMap] = None,
         device: Optional[torch.device] = None,
     ) -> Any:
         raise NotImplementedError
@@ -380,12 +622,21 @@ class BoxBuilder(MatrixBuilder):
 
     def run(
         self,
-        data: Any,
+        data: Any = None,
         *,
+        region_map: Optional[RegionMap] = None,
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, torch.Tensor]:
         dtype = self.config.preferred_input_type
-        boxes = convert_array_like(np.asarray(data), dtype=dtype, device=device)
+        if region_map is not None:
+            boxes = boxes_from_region_map(region_map)
+        else:
+            if data is None:
+                raise ValueError(
+                    "BoxBuilder requires box array data or region_map"
+                )
+            boxes = np.asarray(data)
+        boxes = convert_array_like(boxes, dtype=dtype, device=device)
         if boxes.ndim != 2 or boxes.shape[1] != 6:
             raise ValueError(f"boxes must have shape (N, 6); got {getattr(boxes, 'shape', None)}")
         return boxes
@@ -409,6 +660,7 @@ class MaskStackBuilder(MatrixBuilder):
         self,
         data: Any,
         *,
+        region_map: Optional[RegionMap] = None,
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, torch.Tensor]:
         dtype = self.config.preferred_input_type
@@ -424,8 +676,11 @@ class LabelMaskBuilderConfig(MatrixBuilderConfig):
     """Configuration for :class:`LabelMaskBuilder`.
 
     Attributes:
-        label_order: ``"regionprops"`` uses regionprops table order (3D pruning
-            parity); ``"unique"`` uses sorted positive ``np.unique`` ids.
+        label_order: Used only when ``region_map`` is **not** passed to
+            :meth:`OverlapCalculator.run`. ``"regionprops"`` follows
+            regionprops discovery order (default preset, pairs with
+            ``prune_bboxes=True``); ``"unique"`` uses sorted positive
+            ``np.unique`` ids (pairs with dense ``prune_bboxes=False``).
     """
 
     label_order: Literal["regionprops", "unique"] = "regionprops"
@@ -445,14 +700,18 @@ class LabelMaskBuilder(MatrixBuilder):
         self,
         data: Any,
         *,
+        region_map: Optional[RegionMap] = None,
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, torch.Tensor]:
         if isinstance(data, pd.DataFrame):
             raise TypeError(
                 "LabelMaskBuilder expects a 2D/3D integer label volume, not a "
-                "region property DataFrame. Pass the labeled image array (optionally "
-                "filtered to accepted label ids), or use BoxOverlapCalculatorConfig "
-                "with bounding boxes extracted from the table."
+                "region property DataFrame. Pass the labeled image array with "
+                "region_map=(map_a, map_b), or use BoxOverlapCalculatorConfig."
+            )
+        if data is None:
+            raise ValueError(
+                "LabelMaskBuilder requires a label volume when building masks"
             )
         labels = np.asarray(data)
         if labels.ndim not in (2, 3):
@@ -465,7 +724,10 @@ class LabelMaskBuilder(MatrixBuilder):
                 "Region property tables are not valid input for "
                 "LabelOverlapCalculatorConfig."
             )
-        if self.config.label_order == "unique":
+        if region_map is not None:
+            parse_region_map(region_map, require_label_id=True)
+            masks = masks_from_label_volume(labels, region_map)
+        elif self.config.label_order == "unique":
             masks = labels_to_masks(labels)
         else:
             from vistiq.analysis.coincidence import _label_ids_and_boxes
@@ -678,6 +940,8 @@ class MaskIntersectionCalculator(IntersectionCalculator):
         built_b: Any,
         *,
         spacing: SpacingLike = None,
+        boxes_a: Optional[np.ndarray] = None,
+        boxes_b: Optional[np.ndarray] = None,
         device: Optional[torch.device] = None,
     ) -> Union[np.ndarray, torch.Tensor]:
         dtype = self.config.preferred_input_type
@@ -699,16 +963,18 @@ class MaskIntersectionCalculator(IntersectionCalculator):
                 spacing=spacing,
             )
 
-        boxes_a = _boxes_from_masks_numpy(
-            masks_a.detach().cpu().numpy()
-            if isinstance(masks_a, torch.Tensor)
-            else np.asarray(masks_a)
-        )
-        boxes_b = _boxes_from_masks_numpy(
-            masks_b.detach().cpu().numpy()
-            if isinstance(masks_b, torch.Tensor)
-            else np.asarray(masks_b)
-        )
+        if boxes_a is None:
+            boxes_a = _boxes_from_masks_numpy(
+                masks_a.detach().cpu().numpy()
+                if isinstance(masks_a, torch.Tensor)
+                else np.asarray(masks_a)
+            )
+        if boxes_b is None:
+            boxes_b = _boxes_from_masks_numpy(
+                masks_b.detach().cpu().numpy()
+                if isinstance(masks_b, torch.Tensor)
+                else np.asarray(masks_b)
+            )
         n_a, n_b = boxes_a.shape[0], boxes_b.shape[0]
         if n_a == 0 or n_b == 0:
             empty = np.empty((n_a, n_b), dtype=np.float32)
@@ -872,13 +1138,19 @@ class DiceMetricsCalculator(MetricsCalculator):
 
 @dataclass(frozen=True)
 class OverlapResult:
-    """Geometry components and metric matrices from :class:`OverlapCalculator`."""
+    """Geometry components and metric matrices from :class:`OverlapCalculator`.
+
+    Returned when ``return_components=True`` on the config. ``object_ids_a`` and
+    ``object_ids_b`` mirror ``region_map`` key order when a map was provided.
+    """
 
     area_a: Union[np.ndarray, torch.Tensor]
     area_b: Union[np.ndarray, torch.Tensor]
     intersection: Union[np.ndarray, torch.Tensor]
     union: Union[np.ndarray, torch.Tensor]
     metrics: dict[str, Union[np.ndarray, torch.Tensor]]
+    object_ids_a: Optional[tuple[str, ...]] = None
+    object_ids_b: Optional[tuple[str, ...]] = None
 
 
 _PIPELINE_BACKEND_FIELDS = ("preferred_input_type", "preferred_device")
@@ -896,6 +1168,15 @@ class OverlapCalculatorConfig(Configuration):
     on the pipeline child configs, not here. Preset subclasses default all
     children to ``preferred_input_type="torch.Tensor"``; use a different backend
     by reconstructing the container with matching child configs.
+
+    Attributes:
+        return_components: When True, :meth:`OverlapCalculator.run` returns
+            :class:`OverlapResult` instead of formatted metric matrix(es).
+        triangle: Triangle mask applied to each metric (see ``vistiq.constant.matrix``).
+        output_type: ``"dataframe"``, ``"np.ndarray"``, or ``"torch.Tensor"``.
+        annotate: When True and ``output_type="dataframe"``, label rows/columns.
+            With ``region_map``, defaults to ``object_id`` keys; explicit
+            ``annotations`` override display labels (length must match).
     """
 
     builder: MatrixBuilderConfig
@@ -928,7 +1209,12 @@ class OverlapCalculatorConfig(Configuration):
 
 
 class BoxOverlapCalculatorConfig(OverlapCalculatorConfig):
-    """Preset for axis-aligned box batches ``(N, 6)``."""
+    """Preset for axis-aligned box batches ``(N, 6)`` or ``region_map`` only.
+
+    Pass ``(N, 6)`` arrays to :meth:`OverlapCalculator.run`, or supply
+    ``region_map`` with ``bbox`` on every :class:`RegionSpec` and omit raw
+    box arrays.
+    """
 
     builder: BoxBuilderConfig = Field(default_factory=BoxBuilderConfig)
     area_calculator: BoxAreaCalculatorConfig = Field(
@@ -952,7 +1238,12 @@ class MaskOverlapCalculatorConfig(OverlapCalculatorConfig):
 
 
 class LabelOverlapCalculatorConfig(OverlapCalculatorConfig):
-    """Preset for label volumes (label builder → mask area/intersection path)."""
+    """Preset for label volumes (label builder → mask area/intersection path).
+
+    Requires 2D/3D integer label arrays as ``a`` and ``b``. With ``region_map``,
+    masks are built per ``object_id`` using each spec's ``label_id``; bboxes
+    enable pruning when ``prune_bboxes=True`` (default on this preset).
+    """
 
     builder: LabelMaskBuilderConfig = Field(
         default_factory=lambda: LabelMaskBuilderConfig(label_order="regionprops")
@@ -1028,9 +1319,10 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
     @task(name="OverlapCalculator.run", task_run_name=generate_name)
     def run(
         self,
-        a: Any,
-        b: Any,
+        a: Any = None,
+        b: Any = None,
         *,
+        region_map: Optional[tuple[RegionMap, RegionMap]] = None,
         spacing: SpacingLike = None,
         annotations: Optional[tuple[tuple[str, ...], tuple[str, ...]]] = None,
         device: Optional[torch.device] = None,
@@ -1041,18 +1333,87 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
         dict[str, Union[np.ndarray, torch.Tensor, pd.DataFrame]],
         OverlapResult,
     ]:
-        """Compute overlap metric(s) between two collections."""
+        """Compute overlap metric(s) between two collections.
+
+        Args:
+            a: First collection (boxes ``(N, 6)``, masks ``(N, *spatial)``, or
+                label volume for :class:`LabelOverlapCalculatorConfig`).
+            b: Second collection, same representation as ``a``.
+            region_map: Pair of maps keyed by ``object_id``. Defines which
+                regions to compare and their ``label_id`` / ``bbox``. Row and
+                column order follow map insertion order (dataframe row order from
+                :func:`region_map_from_dataframe`).
+            spacing: Physical voxel size ``(dz, dy, dx)`` aligned with array
+                axes (same convention as ``metadata["scale"]`` from
+                :class:`RegionAnalyzer`). Scales areas and dense intersections;
+                IoU/IoS/Dice ratios are unchanged under uniform scaling.
+            annotations: Optional ``(row_labels, col_labels)`` for DataFrame
+                output when ``annotate=True``. Overrides ``object_id`` display
+                names; lengths must match region counts. Ignored when
+                ``annotate=False``.
+            device: Torch device override when using tensor backends.
+
+        Returns:
+            A single matrix, dict of named matrices (multiple metrics),
+            :class:`OverlapResult` when ``return_components=True``, formatted
+            per ``output_type`` and ``annotate``.
+        """
+        is_label_builder = isinstance(self.config.builder, LabelMaskBuilderConfig)
+        is_box_builder = isinstance(self.config.builder, BoxBuilderConfig)
+
+        region_ctx_a: Optional[RegionBuildContext] = None
+        region_ctx_b: Optional[RegionBuildContext] = None
+        if region_map is not None:
+            region_ctx_a = parse_region_map(
+                region_map[0],
+                require_label_id=is_label_builder,
+                require_bbox=is_box_builder,
+            )
+            region_ctx_b = parse_region_map(
+                region_map[1],
+                require_label_id=is_label_builder,
+                require_bbox=is_box_builder,
+            )
+            annotations = _resolve_output_annotations(
+                annotations,
+                region_map,
+                annotate=self.config.annotate,
+            )
+
+        if is_box_builder and region_map is None and (a is None or b is None):
+            raise ValueError(
+                "BoxOverlapCalculator requires box arrays or region_map"
+            )
+        if is_label_builder and (a is None or b is None):
+            raise ValueError(
+                "LabelOverlapCalculator requires label volumes for both inputs"
+            )
+        if not is_box_builder and not is_label_builder and (a is None or b is None):
+            raise ValueError("Both inputs are required")
+
         device = resolve_torch_device(
             device,
             preferred_input_type=self.config.builder.preferred_input_type,
             preferred_device=self.config.builder.preferred_device,
         )
-        built_a = self._builder.run(a, device=device)
-        built_b = self._builder.run(b, device=device)
+        map_a = region_map[0] if region_map is not None else None
+        map_b = region_map[1] if region_map is not None else None
+        built_a = self._builder.run(a, region_map=map_a, device=device)
+        built_b = self._builder.run(b, region_map=map_b, device=device)
         area_a = self._area.run(built_a, spacing=spacing, device=device)
         area_b = self._area.run(built_b, spacing=spacing, device=device)
+        intersection_kwargs: dict[str, Any] = {}
+        if isinstance(self._intersection, MaskIntersectionCalculator):
+            if region_ctx_a is not None:
+                intersection_kwargs["boxes_a"] = region_ctx_a.boxes
+            if region_ctx_b is not None:
+                intersection_kwargs["boxes_b"] = region_ctx_b.boxes
         inter = self._intersection.run(
-            built_a, built_b, spacing=spacing, device=device
+            built_a,
+            built_b,
+            spacing=spacing,
+            device=device,
+            **intersection_kwargs,
         )
         union = union_matrix(area_a, area_b, inter=inter)
 
@@ -1067,6 +1428,9 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
             matrix = apply_triangle_mask(matrix, self.config.triangle)
             raw_metrics[metric_calc.metric_name] = matrix
 
+        object_ids_a = region_ctx_a.object_ids if region_ctx_a is not None else None
+        object_ids_b = region_ctx_b.object_ids if region_ctx_b is not None else None
+
         if self.config.return_components:
             return OverlapResult(
                 area_a=area_a,
@@ -1074,6 +1438,8 @@ class OverlapCalculator(Configurable[OverlapCalculatorConfig]):
                 intersection=inter,
                 union=union,
                 metrics=raw_metrics,
+                object_ids_a=object_ids_a,
+                object_ids_b=object_ids_b,
             )
 
         if len(raw_metrics) == 1:
