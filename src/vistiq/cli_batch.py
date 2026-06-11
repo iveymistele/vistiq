@@ -74,6 +74,7 @@ def regions_to_dataframe(regions: Any) -> pd.DataFrame:
             for prop in (
                 "area",
                 "volume",
+                "cross_sectional_area",
                 "aspect_ratio",
                 "sphericity",
                 "solidity",

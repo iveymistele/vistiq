@@ -1232,6 +1232,7 @@ class MicroSAMSegmenter(Segmenter):
                         "centroid",
                         "bbox",
                         "volume",
+                        "cross_sectional_area",
                         "aspect_ratio",
                         "sphericity",
                     ],
