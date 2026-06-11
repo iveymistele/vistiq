@@ -62,7 +62,7 @@ def _register_all_configurables() -> None:
         [
             "vistiq.io",  # FileList, DataLoader, ImageLoader, DataWriter, ImageWriter
             "vistiq.preprocess",  # Preprocessor classes
-            "vistiq.seg",  # Segmenter classes
+            "vistiq.segment",  # Segmenter classes
             "vistiq.analysis",  # Analysis classes
             "vistiq.train",  # Trainer classes
             "vistiq.core",  # Core classes
@@ -120,15 +120,15 @@ class CLIAppConfig(BaseModel):
 
     Attributes:
         loglevel: Logging level for the application (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-        device: Device to use for processing (cuda, mps, cpu, or auto).
+        device: Device to use for processing (cuda, mps, cpu, or None for automatic).
         processes: Number of processes to use for processing. Defaults to 1.
     """
 
     loglevel: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
     )
-    device: Literal["cuda", "mps", "cpu", "auto"] = Field(
-        default="auto", description="Device to use for processing"
+    device: Optional[Literal["cuda", "mps", "cpu"]] = Field(
+        default=None, description="Device to use for processing (None = automatic)"
     )
     processes: Optional[int] = Field(
         default=1, description="Number of processes to use for processing"
@@ -569,8 +569,8 @@ def build_component_chain(
 def common_callback(
     ctx: Context,
     loglevel: str = Option("INFO", help="Logging level"),
-    device: Literal["cuda", "mps", "cpu", "auto"] = Option(
-        "auto", help="Device to use for processing"
+    device: Optional[Literal["cuda", "mps", "cpu"]] = Option(
+        None, help="Device to use for processing (omit for automatic selection)"
     ),
     processes: Optional[int] = Option(1, help="Number of processes to use"),
 ) -> None:
@@ -582,7 +582,7 @@ def common_callback(
     Args:
         ctx: Typer context object for sharing data between callbacks and commands.
         loglevel: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-        device: Device to use for processing (cuda, mps, cpu, or auto).
+        device: Device to use for processing (cuda, mps, cpu, or None for automatic).
         processes: Number of processes to use for processing.
     """
     # Configure logging as early as possible
@@ -864,14 +864,14 @@ def cli_command_config(
     # Try ctx.obj first (recommended), then ctx.params (for compatibility)
     if ctx.obj is not None and isinstance(ctx.obj, dict):
         loglevel = ctx.obj.get("loglevel", "INFO")
-        device = ctx.obj.get("device", "auto")
+        device = ctx.obj.get("device")
         processes = ctx.obj.get("processes", 1)
         logger.debug(
             f"Retrieved from ctx.obj: loglevel={loglevel}, device={device}, processes={processes}"
         )
     elif hasattr(ctx, "params") and ctx.params is not None:
         loglevel = ctx.params.get("loglevel", "INFO")
-        device = ctx.params.get("device", "auto")
+        device = ctx.params.get("device")
         processes = ctx.params.get("processes", 1)
         logger.debug(
             f"Retrieved from ctx.params: loglevel={loglevel}, device={device}, processes={processes}"
@@ -879,14 +879,14 @@ def cli_command_config(
     else:
         logger.info("Context not available, using defaults")
         loglevel = "INFO"
-        device = "auto"
+        device = None
         processes = 1
 
     # Validate device value matches Literal type
-    valid_devices = ("cuda", "mps", "cpu", "auto")
+    valid_devices = (None, "cuda", "mps", "cpu")
     if device not in valid_devices:
-        logger.warning(f"Invalid device value '{device}', defaulting to 'auto'")
-        device = "auto"
+        logger.warning(f"Invalid device value '{device}', defaulting to automatic")
+        device = None
 
     # Only pass loader/output if they're not None, otherwise use defaults from default_factory
     config_kwargs = {
@@ -1611,7 +1611,7 @@ def run_training(config: CLITrainerConfig) -> None:
     # Create trainer and run
     # Create MicroSAMTrainerConfig from TrainConfig
     # MicroSAMTrainerConfig inherits from TrainerConfig, so we pass all fields
-    # Note: device is already resolved in main() function (auto -> actual device)
+    # Note: device=None selects the best available device at runtime
     microsam_trainer_config = None
     for c in config.step:
         if isinstance(c, MicroSAMTrainerConfig):

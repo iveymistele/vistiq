@@ -69,6 +69,9 @@ class Preprocessor(StackProcessor):
     normalization and dtype conversion/scaling in a consistent way.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: PreprocessorConfig):
         """Initialize the preprocessor.
 

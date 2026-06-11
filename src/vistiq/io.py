@@ -789,6 +789,9 @@ class DataWriter(Configurable[DataWriterConfig]):
     with support for various formats and options.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: DataWriterConfig):
         """Initialize the data writer.
 
@@ -1054,6 +1057,9 @@ class DataLoader(Configurable[DataLoaderConfig]):
     Subclasses should implement the `run()` method to define their specific
     loading behavior.
     """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
 
     def __init__(self, config: DataLoaderConfig):
         """Initialize the data loader.

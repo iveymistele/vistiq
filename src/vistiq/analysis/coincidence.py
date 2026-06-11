@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import torch
 from pydantic import Field, field_validator
 from prefect import task
 from skimage.measure import regionprops, regionprops_table
@@ -20,9 +21,8 @@ from vistiq.utils import (
     ArrayIterator,
     ArrayIteratorConfig,
     _normalize_stack_names,
-    _torch_imports,
-    check_device,
     create_unique_folder,
+    resolve_torch_device,
 )
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.workflow import Workflow
@@ -254,21 +254,8 @@ def mask_iou_batch_3d(
     return np.vstack(ious).astype(np.float32, copy=False)
 
 
-def _resolve_torch_device(
-    device: Union[str, int, Any, None],
-) -> Any:
-    """Resolve ``device`` to :class:`torch.device` (``None`` -> :func:`check_device`)."""
-    torch = _torch_imports()
-    if device is None:
-        return check_device()
-    if isinstance(device, torch.device):
-        return device
-    return torch.device(device)
-
-
 def _labels_to_masks_torch(labels: Any) -> Any:
     """One binary mask per positive label id, shape ``(N, *spatial)``."""
-    torch = _torch_imports()
     ids = torch.unique(labels)
     ids = ids[ids > 0]
     if ids.numel() == 0:
@@ -282,7 +269,6 @@ def _mask_iou_batch_3d_split_torch(
     overlap_metric: Literal["iou", "ios", "dice"],
 ) -> Any:
     """Pairwise overlap on PyTorch tensors (one chunk of true masks vs all detections)."""
-    torch = _torch_imports()
     count_true, count_det = masks_true.shape[0], masks_detection.shape[0]
     if count_true == 0 or count_det == 0:
         return torch.empty((count_true, count_det), dtype=torch.float32, device=masks_true.device)
@@ -328,8 +314,7 @@ def mask_iou_batch_3d_torch(
     matrix on the host. Uses :func:`~vistiq.utils.check_device` when ``device`` is
     omitted (CUDA, then MPS, then CPU).
     """
-    torch = _torch_imports()
-    torch_device = _resolve_torch_device(device)
+    torch_device = resolve_torch_device(device, preferred_input_type="torch.Tensor")
     masks_true_t = torch.as_tensor(masks_true, device=torch_device)
     masks_detection_t = torch.as_tensor(masks_detection, device=torch_device)
     if masks_true_t.ndim != 4 or masks_detection_t.ndim != 4:
@@ -379,7 +364,6 @@ def _mask_iou_labels_pair_torch(
     overlap_metric: Literal["iou", "ios", "dice"],
 ) -> float:
     """Mask IOU/IOS/Dice for one label id pair on a torch device."""
-    torch = _torch_imports()
     mask_a = labels_a == label_a
     mask_b = labels_b == label_b
     inter = float(torch.logical_and(mask_a, mask_b).sum())
@@ -409,7 +393,6 @@ def _labels_iou_batch_3d_dense_torch(
     device: Union[str, int, Any, None],
 ) -> np.ndarray[np.float32]:
     """Dense mask-batch path on a torch device."""
-    torch = _torch_imports()
     masks_true = _labels_to_masks_torch(labels_true_t)
     masks_detection = _labels_to_masks_torch(labels_detection_t)
     if masks_true.ndim == 3:
@@ -453,8 +436,7 @@ def labels_iou_batch_3d_torch(
     Returns:
         Host NumPy matrix ``(N, M)`` aligned with regionprops label order.
     """
-    torch = _torch_imports()
-    torch_device = _resolve_torch_device(device)
+    torch_device = resolve_torch_device(device, preferred_input_type="torch.Tensor")
     labels_true = np.asarray(labels_true)
     labels_detection = np.asarray(labels_detection)
     if labels_true.shape != labels_detection.shape:
@@ -593,6 +575,32 @@ def labels_iou_batch_3d(
         n_pairs,
     )
     return out
+
+
+def box_iou_batch_3d_torch(
+    boxes_true: np.typing.NDArray[np.number],
+    boxes_detection: np.typing.NDArray[np.number],
+    overlap_metric: Literal["iou", "ios", "dice"] = "iou",
+    device: Union[str, int, Any, None] = None,
+) -> np.ndarray[np.float32]:
+    """PyTorch-backed pairwise box overlap; returns a host NumPy matrix."""
+    from vistiq.analysis.overlap import (
+        BoxOverlapCalculatorConfig,
+        OverlapCalculator,
+        metrics_calculator_configs,
+    )
+
+    calc = OverlapCalculator(
+        BoxOverlapCalculatorConfig(
+            metrics_calculators=metrics_calculator_configs(
+                (overlap_metric.lower(),)
+            ),
+            preferred_input_type="torch.Tensor",
+            output_type="np.ndarray",
+        )
+    )
+    result = calc.run(boxes_true, boxes_detection, device=device)
+    return np.asarray(result, dtype=np.float32)
 
 
 def box_iou_batch_3d(

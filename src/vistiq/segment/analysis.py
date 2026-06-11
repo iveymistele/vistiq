@@ -1,7 +1,7 @@
 import logging
 import uuid
 from functools import wraps
-from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,263 @@ from vistiq.segment._debug import debug_mask_labels
 from vistiq.utils import ArrayIteratorConfig, axis_labels_from_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_attribute_list(
+    attributes: Optional[Union[str, List[str]]],
+) -> List[str]:
+    """Normalize *attributes* to a (possibly empty) list of selectors."""
+    if attributes is None:
+        return []
+    return attributes if isinstance(attributes, list) else [attributes]
+
+
+def _is_scalar(value: Any) -> bool:
+    """Return whether *value* is a single filterable scalar (not vector/dict)."""
+    return not isinstance(value, (tuple, list, np.ndarray, dict))
+
+
+def _region_attribute_raw(region: Any, col: str) -> Any:
+    """Read an attribute without scalar coercion (for vector flattening)."""
+    if col in region.__dict__:
+        return region.__dict__[col]
+    if col != RegionAnalyzer.base_property_name(col):
+        return RegionAnalyzer.get_region_attribute(region, col)
+    return getattr(region, col)
+
+
+def _region_attribute_cell(region: Any, col: str, scalar_only: bool = True) -> Any:
+    """Read one attribute from *region*.
+
+    Args:
+        region: :class:`RegionProperties` instance.
+        col: Attribute or mapped column name.
+        scalar_only: When ``True``, use :meth:`RegionAnalyzer.get_region_attribute`
+            and raise if the resolved value is a vector or dict. When ``False``,
+            return the raw property (vectors are flattened later).
+
+    Raises:
+        ValueError: If ``scalar_only`` is ``True`` and the value is not scalar.
+        AttributeError: If the attribute cannot be resolved.
+    """
+    if scalar_only:
+        value = RegionAnalyzer.get_region_attribute(region, col)
+        if not _is_scalar(value):
+            raise ValueError(
+                f"Attribute '{col}' is not scalar (got {type(value).__name__!r}); "
+                "use mapped component names (e.g. 'centroid-y') or explicit scalar columns."
+            )
+        return value
+    try:
+        return _region_attribute_raw(region, col)
+    except AttributeError as exc:
+        raise AttributeError(
+            f"'{type(region).__name__}' object has no attribute '{col}'"
+        ) from exc
+
+
+def _attribute_as_1d(region: Any, col: str, *, scalar_only: bool) -> np.ndarray:
+    """Read one attribute and return its values as a 1-D array."""
+    value = _region_attribute_cell(region, col, scalar_only=scalar_only)
+    return np.atleast_1d(np.asarray(value)).ravel()
+
+
+def region_column_names(
+    regions: List[Any],
+    attributes: Optional[Union[str, List[str]]] = None,
+    scalar_only: bool = False,
+) -> List[str]:
+    """Resolve attribute column names for :class:`RegionProperties` input.
+
+    When *attributes* is set, those names are returned unchanged. When
+    *attributes* is ``None`` or empty, uses ``_vistiq_property_names`` attached
+    by :class:`RegionAnalyzer` (if present), plus any other materialized
+    ``region.__dict__`` keys. Each candidate must resolve on at least one
+    region; with ``scalar_only=True``, vector properties are omitted.
+
+    Args:
+        regions: Region objects used for auto-discovery when *attributes* is
+            unset.
+        attributes: Explicit attribute name(s) to select.
+        scalar_only: When auto-discovering columns, include only scalar
+            properties if ``True``; include vectors too if ``False``.
+
+    Returns:
+        Sorted list of column names.
+    """
+    cols = _normalize_attribute_list(attributes)
+    if cols:
+        return cols
+    if not regions:
+        return []
+
+    candidates: set[str] = set()
+    for region in regions:
+        configured = region.__dict__.get("_vistiq_property_names")
+        if configured:
+            candidates.update(configured)
+        for key in region.__dict__:
+            if not key.startswith("_"):
+                candidates.add(key)
+
+    names: set[str] = set()
+    for name in candidates:
+        for region in regions:
+            try:
+                if scalar_only:
+                    value = RegionAnalyzer.get_region_attribute(region, name)
+                else:
+                    value = _region_attribute_raw(region, name)
+                if _is_scalar(value) or not scalar_only:
+                    names.add(name)
+                    break
+            except (AttributeError, ValueError):
+                continue
+    return sorted(names)
+
+
+def region_to_numpy(
+    region: "RegionProperties",
+    attributes: Optional[Union[str, List[str]]] = None,
+    *,
+    scalar_only: bool = False,
+    cols: Optional[List[str]] = None,
+) -> np.ndarray:
+    """Extract property values from one :class:`RegionProperties` object.
+
+    This is the primitive used by :func:`regions_to_numpy`. Each requested
+    column is read via :meth:`RegionAnalyzer.get_region_attribute`, then
+    raveled and concatenated left-to-right into a single 1-D feature vector.
+
+    Args:
+        region: Region object to read.
+        attributes: Attribute name(s) to select. When unset, keys from
+            ``region.__dict__`` are auto-discovered on this object only.
+        scalar_only: When ``True``, vector or dict attributes raise
+            :class:`ValueError` at read time; when auto-discovering columns,
+            only scalar keys are listed. When ``False``, vectors are flattened
+            into the output (e.g. ``centroid`` contributes ``ndim`` values).
+        cols: Pre-resolved column names. When provided, *attributes* is not
+            used for column resolution (used internally by
+            :func:`regions_to_numpy`).
+
+    Returns:
+        1-D NumPy array of flattened values, or an empty array when no columns
+        resolve.
+    """
+    if cols is None:
+        cols = region_column_names([region], attributes, scalar_only=scalar_only)
+    if not cols:
+        return np.array([])
+    return np.concatenate(
+        [_attribute_as_1d(region, col, scalar_only=scalar_only) for col in cols]
+    )
+
+
+def regions_to_numpy(
+    regions: List["RegionProperties"],
+    attributes: Optional[Union[str, List[str]]] = None,
+    scalar_only: bool = False,
+) -> np.ndarray:
+    """Extract property values from a list of :class:`RegionProperties` objects.
+
+    Column names are resolved once across *regions*, then each region is
+    converted with :func:`region_to_numpy` and stacked with :func:`numpy.vstack`.
+
+    Mapped names (for example ``cross_sectional_area-xy``) are resolved through
+    :meth:`RegionAnalyzer.get_region_attribute`. When *attributes* is unset,
+    keys from ``region.__dict__`` are auto-discovered; set ``scalar_only=True``
+    to omit vector properties, or pass vector names explicitly with
+    ``scalar_only=False`` to flatten them.
+
+    Args:
+        regions: Region objects to convert.
+        attributes: Attribute name(s) to select. When unset, keys are
+            auto-discovered from the union of all regions.
+        scalar_only: Forwarded to :func:`region_column_names` and
+            :func:`region_to_numpy`.
+
+    Returns:
+        ``(n_regions,)`` when there is a single scalar column; otherwise
+        ``(n_regions, n_features)`` where *n_features* is the total flattened
+        width of all requested columns. Empty inputs yield ``(0, 0)`` or
+        ``(n_regions, 0)`` when no columns resolve.
+    """
+    if not regions:
+        return np.empty((0, 0))
+    cols = region_column_names(regions, attributes, scalar_only=scalar_only)
+    if not cols:
+        return np.empty((len(regions), 0))
+    rows = [
+        region_to_numpy(
+            region,
+            scalar_only=scalar_only,
+            cols=cols,
+        )
+        for region in regions
+    ]
+    matrix = np.vstack(rows)
+    if len(cols) == 1 and matrix.shape[1] == 1:
+        return matrix[:, 0]
+    return matrix
+
+
+def dataframe_to_numpy(
+    df: pd.DataFrame,
+    attributes: Optional[Union[str, List[str]]] = None,
+    strict: bool = True,
+) -> Optional[np.ndarray]:
+    """Select DataFrame column(s) and return them as a NumPy array.
+
+    Companion to :func:`regions_to_numpy` for tabular region output from
+    :class:`RegionAnalyzer` (``output_type="dataframe"``).
+
+    When *attributes* is ``None`` or empty, returns the full table via
+    :meth:`~pandas.DataFrame.to_numpy`. String selectors name columns; integer
+    selectors choose by position via ``iloc``.
+
+    Args:
+        df: Region property table.
+        attributes: Column name(s) or integer position(s) to select.
+        strict: When ``True`` (default), string selectors must match column
+            names exactly. When ``False``, string selectors match any column
+            whose name starts with the selector (useful for prefixes such as
+            ``centroid`` matching ``centroid-y``, ``centroid-z``, …).
+
+    Returns:
+        NumPy array of selected values, or ``None`` when no matching columns
+        remain. A single selected column yields ``(n_rows,)``; multiple columns
+        yield ``(n_rows, n_cols)``.
+
+    Raises:
+        ValueError: If attribute entries are neither strings nor integers.
+    """
+    attribute_list = _normalize_attribute_list(attributes)
+    if not attribute_list:
+        return df.to_numpy()
+    if isinstance(attribute_list[0], str):
+        if strict:
+            existing = [col for col in attribute_list if col in df.columns]
+        else:
+            existing = [col for col in df.columns if any(col.startswith(attr) for attr in attribute_list)]
+        if not existing:
+            return None
+        if len(existing) == 1:
+            return df[existing[0]].to_numpy()
+        return df[existing].to_numpy()
+    if isinstance(attribute_list[0], int):
+        existing = [col for col in attribute_list if col < df.shape[1]]
+        missing = [col for col in attribute_list if col not in existing]
+        if missing:
+            logger.warning(
+                "Attribute index(es) %s out of range for DataFrame; skipping filter",
+                missing,
+            )
+        if not existing:
+            return None
+        selected = df.iloc[:, existing] if len(existing) > 1 else df.iloc[:, existing[0]]
+        return selected.to_numpy()
+    raise ValueError(f"Invalid attribute list type: {type(attribute_list[0])}")
 
 
 class RegionAnalyzer(StackProcessor):
@@ -544,6 +801,22 @@ class RegionAnalyzer(StackProcessor):
                 results["slice_id"] = slice_id
         return results
 
+    def _assign_property_names(
+        self, results: List[Any] | pd.DataFrame
+    ) -> List[Any] | pd.DataFrame:
+        """Record configured output property names on list regions for discovery."""
+        if not isinstance(results, list):
+            return results
+        names = set(self.config.properties)
+        for region in results:
+            for key in region.__dict__:
+                if not key.startswith("_"):
+                    names.add(key)
+        property_names = sorted(names)
+        for region in results:
+            region.__dict__["_vistiq_property_names"] = property_names
+        return results
+
     def _slice_axis_labels(
         self,
         labels_ndim: int,
@@ -1065,6 +1338,9 @@ class RegionAnalyzer(StackProcessor):
 
         if slice_annotations:
             results = self._assign_slice_annotations(results, slice_annotations)
+
+        if self.config.output_type == "list":
+            results = self._assign_property_names(results)
 
         if isinstance(results, list):
             logger.debug(

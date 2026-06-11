@@ -8,10 +8,12 @@ from vistiq.utils import (
     ArrayIterator,
     array_content_digest,
     axis_labels_from_metadata,
+    convert_array_like,
     create_unique_folder,
     index_tuple_to_slice_annotations,
     masks_to_labels,
     labels_to_mask,
+    resolve_torch_device,
 )
 
 
@@ -270,4 +272,20 @@ class TestArrayContentDigest:
         a = np.ones((2, 2), dtype=np.uint8)
         b = np.ones((2, 2), dtype=np.uint16)
         assert array_content_digest(a) != array_content_digest(b)
+
+
+class TestResolveTorchDevice:
+    """Tests for torch device resolution helpers."""
+
+    def test_resolve_torch_device_none_uses_check_device(self):
+        device = resolve_torch_device(preferred_input_type="torch.Tensor")
+        assert device.type in {"cpu", "cuda", "mps", "xpu"}
+
+    def test_resolve_torch_device_numpy_backend_returns_none(self):
+        assert resolve_torch_device(preferred_input_type="numpy") is None
+
+    def test_convert_array_like_accepts_backend_name(self):
+        arr = np.array([1.0, 2.0, 3.0])
+        tensor = convert_array_like(arr, dtype="torch.Tensor", device="cpu")
+        assert tensor.device.type == "cpu"
 

@@ -284,11 +284,14 @@ class Configurable(ABC, Generic[ConfigType]):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        config_type = cls._infer_config_type()
+        # Prefer explicit per-class annotations over inherited generic bases
+        # (e.g. RangeFilterConfig on RangeFilter, not FilterConfig from
+        # Configurable[FilterConfig] in __orig_bases__).
+        config_type = cls._infer_config_type_from_from_config()
         if config_type is None:
             config_type = cls._infer_config_type_from_init()
         if config_type is None:
-            config_type = cls._infer_config_type_from_from_config()
+            config_type = cls._infer_config_type()
         if config_type is not None:
             Configurable._registry[config_type] = cls
 
@@ -362,6 +365,8 @@ class Configurable(ABC, Generic[ConfigType]):
     @classmethod
     def create_from_config(cls, config: "Configuration") -> "Configurable":
         """Instantiate the registered configurable for a configuration."""
+        if isinstance(config, Configurable):
+            return config
         instance, error = cls.try_create_from_config(config)
         if error is not None:
             raise RuntimeError(error)
@@ -605,6 +610,9 @@ class StackProcessor(Configurable):
 
     output_options: Literal["stack", "list"] = "stack"
     max_dim_per_process: int = -1
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
 
     def __init__(self, config: StackProcessorConfig):
         """Initialize the stack processor.

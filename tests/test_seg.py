@@ -1,8 +1,8 @@
-"""Tests for vistiq.seg module."""
+"""Tests for vistiq.segment module."""
 import numpy as np
 import pytest
 from vistiq.utils import ArrayIteratorConfig
-from vistiq.seg import (
+from vistiq.segment import (
     RangeThresholdConfig,
     RangeThreshold,
     OtsuThresholdConfig,
@@ -831,6 +831,63 @@ class TestRegionAnalyzer:
 class TestRegionFilterConfig:
     """Tests for RegionFilterConfig validation."""
 
+    def test_filter_create_from_config_resolves_range_filter_config(self):
+        """Filter.create_from_config maps RangeFilterConfig to RangeFilter."""
+        from vistiq.segment.select import Filter
+
+        cfg = RangeFilterConfig(attribute="volume", range=(0.0, float("inf")))
+        resolved = Filter.create_from_config(cfg)
+        assert isinstance(resolved, RangeFilter)
+        assert resolved.config is cfg
+
+    def test_filter_create_from_config_passes_through_filter_instance(self):
+        """Filter.create_from_config returns an existing Filter unchanged."""
+        from vistiq.segment.select import Filter
+
+        existing = RangeFilter(
+            RangeFilterConfig(attribute="volume", range=(1.0, 10.0))
+        )
+        assert Filter.create_from_config(existing) is existing
+
+    def test_region_filter_run_accepts_bare_range_filter_config(self):
+        """RegionFilter.run accepts filters as bare config objects."""
+        import pandas as pd
+
+        regions = pd.DataFrame({"label": [1, 2, 3], "volume": [500.0, 2000.0, 3000.0]})
+        accepted, removed = RegionFilter(
+            RegionFilterConfig(
+                filters=[
+                    RangeFilterConfig(attribute="volume", range=(1800.0, float("inf")))
+                ]
+            )
+        ).run(regions)
+        assert isinstance(accepted, pd.DataFrame)
+        assert isinstance(removed, np.ndarray)
+        assert list(accepted["label"]) == [2, 3]
+        assert list(removed) == [1]
+
+    def test_region_filter_chains_filters_with_and(self):
+        """Multiple RangeFilters are AND-combined; a region must pass every filter."""
+        import pandas as pd
+
+        regions = pd.DataFrame(
+            {
+                "label": [1, 2, 3, 4],
+                "volume": [500.0, 2000.0, 3000.0, 2500.0],
+                "solidity": [0.9, 0.95, 0.5, 0.99],
+            }
+        )
+        accepted, removed = RegionFilter(
+            RegionFilterConfig(
+                filters=[
+                    RangeFilterConfig(attribute="volume", range=(1800.0, float("inf"))),
+                    RangeFilterConfig(attribute="solidity", range=(0.9, 1.0)),
+                ]
+            )
+        ).run(regions)
+        assert list(accepted["label"]) == [2, 4]
+        assert set(removed) == {1, 3}
+
     def test_accepts_mapped_cross_sectional_area_columns(self):
         """RangeFilter may target map_axes plane columns."""
         config = RegionFilterConfig(
@@ -932,4 +989,238 @@ class TestRemapLabels:
         unique_all = np.unique(result)
         expected = np.arange(len(unique_all))
         np.testing.assert_array_equal(np.sort(unique_all), expected)
+
+
+class TestTopKFilter:
+    """Tests for TopKFilter index selection."""
+
+    def test_axis_none_global_smallest(self):
+        """axis=None selects globally over a flattened array."""
+        import torch
+        from vistiq.segment.select import FULL, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
+        coords = TopKFilter(
+            TopKFilterConfig(k=2, axis=None, largest=False, triangle=FULL)
+        ).accept_indices(values)
+        assert coords.shape == (2, 2)
+        selected = sorted(tuple(row) for row in coords)
+        assert selected == [(0, 1), (1, 0)]
+
+    def test_off_diagonal_rowwise_nearest(self):
+        """OFF_DIAGONAL skips self-pairs on square distance matrices."""
+        import torch
+        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor(
+            [
+                [0.0, 5.0, 2.0],
+                [5.0, 0.0, 4.0],
+                [2.0, 4.0, 0.0],
+            ]
+        )
+        coords = TopKFilter(
+            TopKFilterConfig(
+                k=1, axis=1, largest=False, triangle=OFF_DIAGONAL, ignore_nan=False
+            )
+        ).accept_indices(values)
+        assert coords.shape == (3, 2)
+        assert coords[0].tolist() == [0, 2]
+        assert coords[1].tolist() == [1, 2]
+        assert coords[2].tolist() == [2, 0]
+
+    def test_ignore_nan(self):
+        """ignore_nan excludes NaN entries from selection."""
+        import torch
+        from vistiq.segment.select import TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([float("nan"), 3.0, 1.0, 2.0])
+        idx = TopKFilter(
+            TopKFilterConfig(k=2, axis=None, largest=False, ignore_nan=True)
+        ).accept_indices(values)
+        np.testing.assert_array_equal(idx, [2, 3])
+
+    def test_axis_none_off_diagonal(self):
+        """axis=None with OFF_DIAGONAL excludes diagonal on square matrices."""
+        import torch
+        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor(
+            [
+                [0.0, 4.0],
+                [3.0, 0.0],
+            ]
+        )
+        coords = TopKFilter(
+            TopKFilterConfig(
+                k=1, axis=None, largest=False, triangle=OFF_DIAGONAL, ignore_nan=False
+            )
+        ).accept_indices(values)
+        assert coords.shape == (1, 2)
+        assert coords[0].tolist() == [1, 0]
+
+    def test_output_values(self):
+        """output='values' returns selected entries as a tensor."""
+        import torch
+        from vistiq.segment.select import OFF_DIAGONAL, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor(
+            [
+                [0.0, 5.0, 2.0],
+                [5.0, 0.0, 4.0],
+                [2.0, 4.0, 0.0],
+            ]
+        )
+        selected = TopKFilter(
+            TopKFilterConfig(
+                k=1,
+                axis=1,
+                largest=False,
+                triangle=OFF_DIAGONAL,
+                ignore_nan=False,
+                output="values",
+            )
+        ).apply(values)
+        assert isinstance(selected, torch.Tensor)
+        assert selected.tolist() == [2.0, 4.0, 2.0]
+
+    def test_output_mask(self):
+        """output='mask' returns a boolean tensor with True at selected cells."""
+        import torch
+        from vistiq.segment.select import TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
+        mask = TopKFilter(
+            TopKFilterConfig(k=1, axis=1, largest=False, output="mask")
+        ).apply(values)
+        assert isinstance(mask, torch.Tensor)
+        assert mask.dtype == torch.bool
+        assert mask.tolist() == [[False, True], [False, True]]
+
+    def test_output_masked_values(self):
+        """output='masked_values' keeps matrix shape and NaN-fills unselected cells."""
+        import torch
+        from vistiq.segment.select import TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[3.0, 1.0], [4.0, 2.0]])
+        masked = TopKFilter(
+            TopKFilterConfig(k=1, axis=1, largest=False, output="masked_values")
+        ).apply(values)
+        assert isinstance(masked, torch.Tensor)
+        assert masked.shape == values.shape
+        assert masked[0, 1].item() == 1.0
+        assert masked[1, 1].item() == 2.0
+        assert torch.isnan(masked[0, 0])
+        assert torch.isnan(masked[1, 0])
+
+
+class TestValueFilter:
+    """Tests for ValueFilter matrix thresholding."""
+
+    def test_lte_mask_default_output(self):
+        """Default output='mask' returns True where values <= threshold."""
+        import torch
+        from vistiq.segment import MatrixFilter, ValueFilter, ValueFilterConfig
+
+        values = torch.tensor([[1.0, 5.0], [3.0, 2.0]])
+        mask = ValueFilter(
+            ValueFilterConfig(ref_value=2.5, operator="<=")
+        ).apply(values)
+        assert isinstance(mask, torch.Tensor)
+        assert mask.dtype == torch.bool
+        assert mask.tolist() == [[True, False], [False, True]]
+        assert isinstance(ValueFilter(ValueFilterConfig(ref_value=1.0)), MatrixFilter)
+
+    def test_off_diagonal(self):
+        """OFF_DIAGONAL excludes self-pairs even when they pass the threshold."""
+        import torch
+        from vistiq.segment import OFF_DIAGONAL, ValueFilter, ValueFilterConfig
+
+        values = torch.tensor([[0.0, 4.0], [3.0, 0.0]])
+        mask = ValueFilter(
+            ValueFilterConfig(
+                threshold=1.0,
+                operator="<=",
+                triangle=OFF_DIAGONAL,
+                ignore_nan=False,
+            )
+        ).apply(values)
+        assert mask.tolist() == [[False, False], [False, False]]
+
+    def test_lower_triangle_only(self):
+        """LOWER selects lower triangle including diagonal (i >= j)."""
+        import torch
+        from vistiq.segment import LOWER, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
+        mask = TopKFilter(
+            TopKFilterConfig(k=10, axis=None, largest=False, triangle=LOWER, output="mask")
+        ).apply(values)
+        assert mask.tolist() == [
+            [True, False, False],
+            [True, True, False],
+            [True, True, True],
+        ]
+
+    def test_lower_triangle_rowwise(self):
+        """LOWER with axis=1 does not zero the full matrix when one row lacks strict-lower cells."""
+        import torch
+        from vistiq.segment import LOWER, TopKFilter, TopKFilterConfig
+
+        dist = torch.tensor([[0.0, 5.0, 2.0], [5.0, 0.0, 4.0], [2.0, 4.0, 0.0]])
+        masked = TopKFilter(
+            TopKFilterConfig(
+                k=1, axis=1, largest=False, triangle=LOWER, output="masked_values"
+            )
+        ).run(dist)
+        assert masked[0, 0].item() == 0.0
+        assert masked[1, 1].item() == 0.0
+        assert masked[2, 2].item() == 0.0
+        assert torch.isnan(masked[0, 1])
+
+    def test_lower_nd_triangle(self):
+        """LOWER_ND selects strict lower triangle (i > j) only."""
+        import torch
+        from vistiq.segment import LOWER_ND, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
+        mask = TopKFilter(
+            TopKFilterConfig(k=10, axis=None, largest=False, triangle=LOWER_ND, output="mask")
+        ).apply(values)
+        assert mask.tolist() == [
+            [False, False, False],
+            [True, False, False],
+            [True, True, False],
+        ]
+
+    def test_upper_nd_triangle(self):
+        """UPPER_ND selects strict upper triangle (i < j) only."""
+        import torch
+        from vistiq.segment import UPPER_ND, TopKFilter, TopKFilterConfig
+
+        values = torch.tensor([[9.0, 1.0, 2.0], [3.0, 8.0, 4.0], [5.0, 6.0, 7.0]])
+        mask = TopKFilter(
+            TopKFilterConfig(k=10, axis=None, largest=False, triangle=UPPER_ND, output="mask")
+        ).apply(values)
+        assert mask.tolist() == [
+            [False, True, True],
+            [False, False, True],
+            [False, False, False],
+        ]
+
+    def test_masked_values_output(self):
+        """output='masked_values' preserves passing entries only."""
+        import torch
+        from vistiq.segment import ValueFilter, ValueFilterConfig
+
+        values = torch.tensor([[1.0, 5.0], [3.0, 2.0]])
+        masked = ValueFilter(
+            ValueFilterConfig(
+                ref_value=2.5, operator="<=", output="masked_values"
+            )
+        ).apply(values)
+        assert masked[0, 0].item() == 1.0
+        assert masked[1, 1].item() == 2.0
+        assert torch.isnan(masked[0, 1])
+        assert torch.isnan(masked[1, 0])
 

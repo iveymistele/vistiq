@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from vistiq.core import ArrayIteratorConfig
 from vistiq.preprocess import DoG, DoGConfig
-from vistiq.seg import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
+from vistiq.segment import MicroSAMSegmenter, MicroSAMSegmenterConfig, RegionFilter, RegionFilterConfig, RangeFilter, RangeFilterConfig
 from vistiq.analysis import CoincidenceDetector, CoincidenceDetectorConfig
 from vistiq.utils import load_image, get_scenes
 from bioio_ome_tiff.writers import OmeTiffWriter
@@ -135,7 +135,7 @@ def coincidence(input_path, sigma_low, sigma_high, normalize, area_lower, area_u
     # Set up configurations
     dog_config = DoGConfig(sigma_low=sigma_low, sigma_high=sigma_high, normalize=normalize)
     region_filter_config = RegionFilterConfig(
-        filters=[RangeFilter(RangeFilterConfig(attribute="area", range=(area_lower, area_upper)))]
+        filters=[RangeFilterConfig(attribute="area", range=(area_lower, area_upper))]
     )
     volume_it_cfg = ArrayIteratorConfig(slice_def=(-3, -2, -1))
     coincidence_config = CoincidenceDetectorConfig(

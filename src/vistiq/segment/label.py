@@ -15,7 +15,7 @@ from micro_sam.automatic_segmentation import (
 from micro_sam.multi_dimensional_segmentation import merge_instance_segmentation_3d
 
 from prefect import task, flow
-from pydantic import field_validator, model_validator, PositiveInt
+from pydantic import Field, field_validator, model_validator, PositiveInt
 from skimage.measure import label as sk_label
 
 from vistiq.core import (
@@ -43,20 +43,23 @@ from vistiq.preprocess import (
 
 from vistiq.workflow import Workflow, WorkflowConfig
 
+from vistiq.analysis.overlap import OverlapCalculator, MaskOverlapCalculatorConfig
+from vistiq.analysis.matrix import group_matrix_indices
+from vistiq.constant.matrix import LOWER_ND
+
 from vistiq.segment._debug import debug_mask_labels
 from vistiq.segment.analysis import RegionAnalyzer, RegionAnalyzerConfig
 from vistiq.segment.postprocess import (
-    BinaryProcessor,
+    BinaryProcessorConfig,
     dilate_regions,
 )
 from vistiq.segment.select import (
-    RegionFilter,
     RegionFilterConfig,
+    _filter_config_entry,
 )
 from vistiq.segment.threshold import (
-    OtsuThreshold,
     OtsuThresholdConfig,
-    Thresholder,
+    ThresholderConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -252,6 +255,9 @@ class SegmenterConfig(StackProcessorConfig):
 
 class Segmenter(StackProcessor):
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
     def __init__(self, config: SegmenterConfig):
         super().__init__(config)
 
@@ -319,6 +325,9 @@ class Merger(StackProcessor):
 
     Used as the optional ``merger`` step in :class:`SegmentationFlow`.
     """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
 
     def __init__(self, config: MergerConfig):
         """Initialize the merger.
@@ -1007,7 +1016,7 @@ class LabellerConfig(StackProcessorConfig):
     """
 
     connectivity: PositiveInt = 1
-    region_filter: Optional[RegionFilter] = None
+    region_filter: Optional[RegionFilterConfig] = None
     output_type: Literal["list"] = "list"
 
 
@@ -1028,32 +1037,6 @@ class Labeller(StackProcessor):
             config: Labeller configuration.
         """
         super().__init__(config)
-        # Create a mapping from function names to functions for extra_properties
-        # extra_props_map = {func.__name__: func for func in Labeller.extra_properties}
-
-        # Determine which extra_properties are needed based on region_filter
-        # if self.config.region_filter is not None and self.config.region_filter.config.filters is not None:
-        #    # Get attribute names used by filters
-        #    filter_attributes = {
-        #        filter.config.attribute
-        #        for filter in self.config.region_filter.config.filters
-        #        if filter.config.attribute is not None
-        #    }
-        #    # Map attribute names to actual callable functions
-        #    self.use_extra_properties = [
-        #        extra_props_map[attr]
-        #        for attr in filter_attributes
-        #        if attr in extra_props_map
-        #    ]
-        # else:
-        #    # No filter or no filters specified
-        #    self.use_extra_properties = None
-
-    # def _process_stack(self, mask: np.ndarray) -> np.ndarray:
-    #    """Process the mask."""
-    #    labels = sk_label(mask, connectivity=self.config.connectivity)
-    #    regions = regionprops(labels)
-    #    return labels, regions
 
     def _process_slice(
         self, mask: np.ndarray, metadata: Optional[dict[str, Any]] = None, **kwargs
@@ -1074,17 +1057,15 @@ class Labeller(StackProcessor):
             - regions: List of region properties for each labeled region.
         """
         labels = sk_label(mask, connectivity=self.config.connectivity)
-        if (
-            self.config.region_filter is not None
-            and self.config.region_filter.config.filters is not None
-        ):
-            extra_properties = [
-                filter.config.attribute
-                for filter in self.config.region_filter.config.filters
-                if filter.config.attribute is not None
-                and filter.config.attribute
-                in RegionAnalyzer.extra_properties_funcs().keys()
-            ]
+        region_filter_cfg = self.config.region_filter
+        if region_filter_cfg is not None and region_filter_cfg.filters:
+            extra_funcs = RegionAnalyzer.extra_properties_funcs()
+            extra_properties = []
+            for f in region_filter_cfg.filters:
+                fc = _filter_config_entry(f)
+                for attr in fc.attribute_list():
+                    if attr in extra_funcs:
+                        extra_properties.append(attr)
         else:
             extra_properties = []
         logger.info(f"extra_properties={extra_properties}")
@@ -1099,10 +1080,9 @@ class Labeller(StackProcessor):
         regions = ra.run(labels)
         logger.info(f"Labeller: len(regions)={len(regions)}")
 
-        if self.config.region_filter is not None:
-            logger.info(
-                f"Labeller: self.config.region_filter.config={self.config.region_filter.config}"
-            )
+        if region_filter_cfg is not None:
+            region_filter = Configurable.create_from_config(region_filter_cfg)
+            logger.info(f"Labeller: region_filter.config={region_filter.config}")
             # Store original labels before filtering
             original_labels = labels.copy()
             # Flatten regions if it's a list of lists (from iterator processing)
@@ -1110,7 +1090,7 @@ class Labeller(StackProcessor):
                 # Check if first element is a list (nested structure from iterator)
                 if isinstance(regions[0], list):
                     regions = [region for sublist in regions for region in sublist]
-            regions, removed_labels = self.config.region_filter.run(regions)
+            regions, removed_labels = region_filter.run(regions)
             labels = np.zeros_like(labels)
             for region in regions:
                 # Use original_labels to create mask, not the zeroed labels
@@ -1477,11 +1457,9 @@ class BasicSegmenterConfig(SegmenterConfig):
         labeller: Connected-component labeler applied to the final mask.
     """
 
-    thresholder: Optional[Thresholder] = OtsuThreshold(OtsuThresholdConfig())
-    binary_processor: Optional[BinaryProcessor] = None
-    labeller: Optional[Labeller] = Labeller(
-        LabellerConfig(connectivity=1, region_filter=None, output_type="list")
-    )
+    thresholder: ThresholderConfig = Field(default_factory=OtsuThresholdConfig)
+    binary_processor: Optional[BinaryProcessorConfig] = None
+    labeller: LabellerConfig = Field(default_factory=LabellerConfig)
 
 
 class BasicSegmenter(Segmenter):
@@ -1490,11 +1468,16 @@ class BasicSegmenter(Segmenter):
         super().__init__(config)
 
     def _process_slice(self, slice, metadata: Optional[dict[str, Any]] = None):
-        mask = thresholder.run(slice, metadata=metadata)
-        if binary_processor is not None:
-            mask = binary_processor.run(mask, metadata=metadata)
-        labels = labeller.run(mask, metadata=metadata)
-        return labels
+        mask = Configurable.create_from_config(self.config.thresholder).run(
+            slice, metadata=metadata
+        )
+        if self.config.binary_processor is not None:
+            mask = Configurable.create_from_config(self.config.binary_processor).run(
+                mask, metadata=metadata
+            )
+        return Configurable.create_from_config(self.config.labeller).run(
+            mask, metadata=metadata
+        )
 
 
 class SegmentationFlowConfig(WorkflowConfig):
@@ -1556,11 +1539,9 @@ class SegmentationFlow(Workflow):
         iterator_config: ArrayIteratorConfig,
     ) -> RegionAnalyzer:
         """Build a :class:`RegionAnalyzer` with properties required by the filter config."""
-        filter_attributes = [
-            f.config.attribute
-            for f in region_filter_config.filters
-            if f.config.attribute is not None
-        ]
+        filter_attributes: list[str] = []
+        for f in region_filter_config.filters or []:
+            filter_attributes.extend(_filter_config_entry(f).attribute_list())
         properties = list(RegionAnalyzer.default_properties)
         properties += [attr for attr in filter_attributes if attr not in properties]
         logger.info(
@@ -1670,7 +1651,7 @@ class TiledSegmentationFlowConfig(SegmentationFlowConfig):
     resize_factor: Tuple[float, ...] = (0.25, 0.25)
     pad_width: Union[int, Tuple[Tuple[int, int]], dict[int, Tuple[int, int]]] = {-2:(0,5), -1:(0,5)}
     iou_threshold: float = 0.5
-    consensus_threshold: float = 0.5
+    consensus_threshold: float = 0.75
 
 
 class TiledSegmentationFlow(SegmentationFlow):
@@ -1713,42 +1694,6 @@ class TiledSegmentationFlow(SegmentationFlow):
         # run segmentation on tiled stack
         t_labels = super()._run(t_stack, *args, metadata=t_metadata, **kwargs)
 
-        # analyze regions
-        bbox_analyzer = RegionAnalyzer(
-            RegionAnalyzerConfig(
-                output_type="dataframe", 
-                properties=["bbox"],
-                iterator_config=ArrayIteratorConfig(slice_def=())
-            )
-        )
-        t_results = bbox_analyzer.run(t_labels, *args, metadata=t_metadata, **kwargs)
-
-        # group regions
-        divisor = t_labels.shape[-1] // self.config.tile_factor[-1]
-        spatial_ndim = t_labels.ndim if t_labels.ndim in (2, 3) else stack.ndim
-        logger.info(
-            f"Divisor: {divisor}, t_labels.shape: {t_labels.shape}, "
-            f"spatial_ndim: {spatial_ndim}, tile_factor: {self.config.tile_factor}, "
-            f"n_regions: {len(t_results)}"
-        )
-        bboxes = region_bbox_array(t_results, spatial_ndim)
-        if bboxes.shape[0] == 0:
-            logger.warning(
-                "TiledSegmentationFlow: no regions detected in tiled analysis; "
-                "returning zero labels"
-            )
-            return (
-                np.zeros(stack.shape, dtype=np.uint16),
-                t_labels,
-                np.empty((0, *t_labels.shape), dtype=bool),
-                np.empty((0, *t_labels.shape), dtype=bool),
-                np.zeros(t_labels.shape[-2:], dtype=bool),
-            )
-
-        t_groups = group_bboxes(
-            bboxes, divisor=divisor, threshold=self.config.iou_threshold
-        )
-
         # convert labels to stack of masks: the stack will have shape (len(t_groups), *t_labels.shape)
         t_masks = labels_to_masks(t_labels)
 
@@ -1760,16 +1705,25 @@ class TiledSegmentationFlow(SegmentationFlow):
         untiled,_ = Untiler(ucfg).run(t_masks)
         t_proj =  np.sum(untiled>0, axis=0)>0
 
+        olcfg = MaskOverlapCalculatorConfig(
+            annotate=False,
+            triangle=LOWER_ND,
+            #output_type="dataframe",
+        )
+        ol = OverlapCalculator(olcfg).run(t_proj, t_proj)
+        groups = group_matrix_indices(ol, threshold=self.config.iou_threshold)
+        logger.info(f"TiledSegmentationFlow: groups={groups}")
         # label grouped mask
-        labels = label_grouped_mask(t_proj, t_groups, threshold=self.config.consensus_threshold)
+        stacks = np.array([(t_proj[g].mean(axis=0)>self.config.consensus_threshold) * (i+1) for i,g in enumerate(groups)])
+        labels = np.sum(stacks, axis=0)
 
         # remove padding
         cropped_height = labels.shape[-2]-self.config.pad_width[-2][1]
         cropped_width = labels.shape[-1]-self.config.pad_width[-1][1]
         cropped_labels = labels[..., 0:cropped_height, 0:cropped_width]
 
-        ecfg = ResizeConfig(width=orig_width, height=orig_height, normalize=False, dtype=np.uint16)
-        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata, **kwargs)
+        ecfg = ResizeConfig(width=orig_width, height=orig_height, anti_aliasing=False, order=0, preserve_range=True, normalize=False, dtype=np.uint16)
+        resized_labels, _ = Resize(ecfg).run(cropped_labels, metadata=r_metadata,  **kwargs)
 
         if resized_labels.shape != stack.shape:
             logging.error(f"resized_labels.shape: {resized_labels.shape} != stack.shape: {stack.shape}")
@@ -1794,4 +1748,4 @@ class TiledSegmentationFlow(SegmentationFlow):
                 )
             )
             resized_labels, _ = label_remover.run(resized_labels, removed_labels)
-        return resized_labels, t_labels, t_masks, untiled, t_proj
+        return resized_labels
