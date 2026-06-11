@@ -40,6 +40,7 @@ FILELIST_SH="$SCRIPT_DIR/filelist.sh"
 
 VISTIQ_SCRATCH="${VISTIQ_SCRATCH:-/scratch/zyh4up/batch-test}"
 VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
+export LD_LIBRARY_PATH="$VISTIQ_ENV/lib:${LD_LIBRARY_PATH:-}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_TIME="${SLURM_TIME:-6:00:00}"
 SCRIB_GLOB="${SCRIB_GLOB:-Animal-*-scrib-dpn-edu.lif}"

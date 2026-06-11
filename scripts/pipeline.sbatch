@@ -97,6 +97,7 @@ echo "Output:  $output_dir"
 module purge
 module load miniforge
 VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
+export LD_LIBRARY_PATH="$VISTIQ_ENV/lib:${LD_LIBRARY_PATH:-}"
 # UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
 # `conda activate` (including `eval "$(conda shell.bash hook)"`). Use the env directly.
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
