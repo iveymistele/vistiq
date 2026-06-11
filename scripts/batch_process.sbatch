@@ -12,7 +12,7 @@ set -e
 
 # Check if file list is provided
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <py_script> <file_list> [output_dir]"
+    echo "Usage: $0 <py_script> <file_list> [output_dir] [extra python args...]"
     echo "  py_script:  The python script to execute"
     echo "  file_list:  Text file with one image file path per line (optionally with output dir as second column)"
     echo "              When run as job array, each task processes the file at line #ARRAY_TASK_ID"
@@ -20,11 +20,20 @@ if [[ $# -lt 2 ]]; then
     echo "              If file list has second column with output dir, it will be used with priority:"
     echo "              - If second column is absolute path, it overrides CLI output_dir"
     echo "              - If second column is relative path, it is joined with CLI output_dir (or PWD)"
+    echo "  extra args: Passed through to the python script after -i and -o, e.g. --n-samples 10"
     exit 1
 fi
 
 py_script="$1"
 file_list="$2"
+shift 2
+if [[ $# -gt 0 && "$1" != --* ]]; then
+    cli_output_dir="$1"
+    shift
+else
+    cli_output_dir="$PWD"
+fi
+extra_args=("$@")
 
 # Check if file list exists and is a file (not a directory)
 if [[ ! -e "$file_list" ]]; then
@@ -76,9 +85,7 @@ fi
 input_file="$input_file_path"
 
 # Determine output directory
-# Priority: 1) Third CLI argument, 2) Second column in file list, 3) Current directory
-cli_output_dir="${3:-$PWD}"
-
+# Priority: 1) Third CLI argument (if not a flag), 2) Second column in file list, 3) PWD
 if [[ -n "$file_output_dir" ]]; then
     # File column exists
     if [[ "$file_output_dir" == /* ]]; then
@@ -103,6 +110,10 @@ fi
 
 echo "Task ID: $TASK_ID"
 echo "Processing file: $input_file"
+echo "Output directory: $output_dir"
+if [[ ${#extra_args[@]} -gt 0 ]]; then
+    echo "Extra python args: ${extra_args[*]}"
+fi
 
 module purge
 module load miniforge
@@ -110,4 +121,4 @@ module load miniforge
 source activate ~/vistiq-env-gpu # replace with your own environment path
 
 # Run Python script on the selected file
-python "$py_script" -i "$input_file" -o "$output_dir"
+python "$py_script" -i "$input_file" -o "$output_dir" "${extra_args[@]}"

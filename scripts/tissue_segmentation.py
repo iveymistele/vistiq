@@ -2,12 +2,12 @@
 """Lobe and brain tissue segmentation (notebook: notebooks/segment-lobe.ipynb).
 
 Loads a multi-channel microscopy volume, preprocesses it, segments lobes with
-tiled MicroSAM, derives a binary brain mask, saves label TIFFs, and writes a
-region-measurements CSV. Napari visualization is omitted.
+tiled MicroSAM, derives a binary brain mask, saves label TIFFs, and writes
+region-measurement CSVs for lobes and brain. Napari visualization is omitted.
 
 Intended for batch use via scripts/batch_process.sbatch::
 
-    python scripts/tissue-seg.py -i "$input_file" -o "$output_dir"
+    python scripts/tissue_segmentation.py -i "$input_file" -o "$output_dir"
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from prefect import flow
 
 import vistiq
 from vistiq.io import ImageLoader, ImageLoaderConfig, ImageWriter, ImageWriterConfig
@@ -57,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         required=True,
         type=Path,
-        help="Output directory for label TIFFs and measurements CSV",
+        help="Output directory for label TIFFs and measurements CSVs",
     )
     parser.add_argument(
         "--scene-index",
@@ -219,6 +220,49 @@ def output_stem(input_path: Path, scene_index: int) -> str:
     return f"{basename}-scene-{scene_index}"
 
 
+REGION_ANALYSIS_PROPERTIES = [
+    "slice_annotations",
+    "volume",
+    "centroid",
+    "cross_sectional_area",
+    "bbox",
+    "aspect_ratio",
+]
+
+
+def build_region_analyzer_config() -> RegionAnalyzerConfig:
+    return RegionAnalyzerConfig(
+        properties=REGION_ANALYSIS_PROPERTIES,
+        iterator_config=ArrayIteratorConfig(slice_def=()),
+        output_type="dataframe",
+        map_axes=True,
+    )
+
+
+def analyze_and_save_regions(
+    labels: np.ndarray,
+    metadata: dict,
+    csv_path: Path,
+    *,
+    label_name: str,
+) -> Path:
+    """Run :class:`RegionAnalyzer` and write measurements sorted by volume."""
+    logger.info("Analyzing %s regions", label_name)
+    measurements = RegionAnalyzer(build_region_analyzer_config()).run(
+        labels,
+        metadata=metadata,
+    )
+    measurements.sort_values(["volume"], ascending=False).to_csv(csv_path, index=False)
+    logger.info(
+        "Wrote %s measurements to %s (%d rows)",
+        label_name,
+        csv_path,
+        len(measurements),
+    )
+    return csv_path
+
+
+@flow(name="vistiq.tissue_segmentation")
 def run_tissue_segmentation(
     input_path: Path,
     output_dir: Path,
@@ -293,34 +337,26 @@ def run_tissue_segmentation(
     logger.info("Saving brain mask to %s", tif_base)
     ImageWriter(writer_config).run(brain_label, tif_base, metadata=brain_metadata)
 
-    logger.info("Analyzing lobe regions")
-    analyzer_config = RegionAnalyzerConfig(
-        properties=[
-            "slice_annotations",
-            "volume",
-            "centroid",
-            "cross_sectional_area",
-            "bbox",
-            "aspect_ratio",
-        ],
-        iterator_config=ArrayIteratorConfig(slice_def=()),
-        output_type="dataframe",
-        map_axes=True,
-    )
-    lobe_measurements = RegionAnalyzer(analyzer_config).run(
+    lobe_csv = analyze_and_save_regions(
         lobe_labels,
-        metadata=lobe_metadata,
+        lobe_metadata,
+        output_dir / f"{stem}.Lobe.csv",
+        label_name="lobe",
     )
-    csv_path = output_dir / f"{stem}.Lobe.csv"
-    lobe_measurements.sort_values(["volume"], ascending=False).to_csv(csv_path, index=False)
-    logger.info("Wrote measurements to %s (%d rows)", csv_path, len(lobe_measurements))
+    brain_csv = analyze_and_save_regions(
+        brain_label,
+        brain_metadata,
+        output_dir / f"{stem}.Brain.csv",
+        label_name="brain",
+    )
 
     lobe_tif = tif_base.with_suffix(".Lobe.tif")
     brain_tif = tif_base.with_suffix(".Brain.tif")
     return {
         "lobe_labels": lobe_tif,
         "brain_mask": brain_tif,
-        "measurements": csv_path,
+        "lobe_measurements": lobe_csv,
+        "brain_measurements": brain_csv,
     }
 
 
