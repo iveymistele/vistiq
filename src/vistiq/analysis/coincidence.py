@@ -672,7 +672,7 @@ class CoincidenceDetectorConfig(StackProcessorConfig):
     """Configuration for coincidence detection workflow.
     
     Attributes:
-        output_type: Output type ("list" or "stack").
+        output_type: Output type ("list" only).
         output: Output fields ("score" or "above_threshold").
         method: Overlap method to use ("iou" or "dice").
         mode: Overlap mode ("box" or "strict").
