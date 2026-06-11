@@ -8,6 +8,8 @@ from typing import Literal, Optional, Union
 import numpy as np
 import torch
 from prefect import task
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from vistiq.constant.matrix import FULL
 from vistiq.core import Configurable, Configuration, generate_name
@@ -15,6 +17,24 @@ from vistiq.utils import convert_array_like, prepare_matrix_values, resolve_torc
 
 logger = logging.getLogger(__name__)
 
+def group_matrix_indices(matrix, threshold=0.5):
+    """Group row/column indices with pairwise overlap > threshold."""
+    m = np.asarray(matrix, dtype=float)
+    n = m.shape[0]
+    # Fill upper triangle from lower (self-comparison matrices are often lower-tri)
+    sym = np.array(m, copy=True)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = sym[i, j], sym[j, i]
+            if np.isnan(a) and np.isnan(b):
+                continue
+            sym[i, j] = sym[j, i] = np.nanmax([a, b])
+    adj = (sym > threshold) & ~np.eye(n, dtype=bool)
+    _, labels = connected_components(csr_matrix(adj.astype(int)), directed=False)
+    groups = {}
+    for idx, lab in enumerate(labels):
+        groups.setdefault(lab, []).append(idx)
+    return [sorted(g) for g in groups.values()]
 
 class MatrixAggregatorConfig(Configuration):
     """Configuration for :class:`MatrixAggregator`.

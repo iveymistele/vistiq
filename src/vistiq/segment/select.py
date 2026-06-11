@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 from prefect import task
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from vistiq.constant.matrix import FULL
 from vistiq.core import Configurable, Configuration, generate_name
@@ -60,6 +60,41 @@ class FilterConfig(Configuration):
         if attribute is None:
             return []
         return attribute if isinstance(attribute, list) else [attribute]
+
+def _reject_configurable_filter_entries(filters: Any) -> Any:
+    """Reject :class:`Configurable` instances in a ``filters`` field value."""
+    if filters is None:
+        return []
+    if not isinstance(filters, list):
+        return filters
+    for index, entry in enumerate(filters):
+        if isinstance(entry, Configurable):
+            raise ValueError(
+                f"filters[{index}] must be a FilterConfig subclass, not "
+                f"{type(entry).__name__}; pass configuration objects only and "
+                "instantiate filters via Filter.create_from_config()."
+            )
+    return filters
+
+
+def _filter_config_entry(entry: FilterConfig) -> FilterConfig:
+    """Return a validated filter config entry."""
+    if isinstance(entry, Configurable):
+        raise TypeError(
+            f"Expected FilterConfig, got {type(entry).__name__}; "
+            "use Filter.create_from_config() at runtime."
+        )
+    return entry
+
+
+def _accept_index_set(
+    indices: Union[np.ndarray, "torch.Tensor", tuple[Any, ...]],
+) -> set[int]:
+    """Normalize :meth:`Filter.accept_indices` output to a set of row indices."""
+    if isinstance(indices, tuple):
+        indices = indices[0]
+    return set(np.asarray(indices, dtype=np.int64).tolist())
+
 
 class Filter(Configurable[FilterConfig]):
     """Base class for selecting rows or regions by property values.
@@ -199,36 +234,80 @@ class FilterOpsConfig(Configuration):
     """Configuration for :class:`FilterOps`.
 
     Attributes:
-        filters: List of :class:`Filter` instances to apply to the data.
+        filters: :class:`FilterConfig` entries combined by *operation*.
+        operation: ``"and"`` (intersection), ``"or"`` (union), ``"xor"``
+            (symmetric difference), or ``"not"`` (complement; exactly one filter).
     """
     filters: List[FilterConfig] = []
     operation: Literal["and", "or", "xor", "not"] = "and"
 
-class FilterOps(Configurable[FilterOpsConfig]):
-    """Apply a logical operation to a list of :class:`Filter` instances.
+    @field_validator("filters", mode="before")
+    @classmethod
+    def _filters_must_be_configs(cls, filters: Any) -> Any:
+        return _reject_configurable_filter_entries(filters)
 
-    Args:
-        config: FilterOps configuration.
-    """
+class FilterOps(Configurable[FilterOpsConfig]):
+    """Combine several :class:`Filter` criteria with a logical operation."""
+
     def __init__(self, config: FilterOpsConfig):
         super().__init__(config)
 
     @classmethod
     def from_config(cls, config: FilterOpsConfig) -> "FilterOps":
-        """Create a FilterOps instance from a configuration.
-
-        Args:
-            config: FilterOps configuration.
-        """
+        """Create a FilterOps instance from a configuration."""
         return cls(config)
 
-    def run(self, data: Union[np.ndarray, List[float], List["RegionProperties"], pd.Series, pd.DataFrame]) -> np.ndarray:
-        """Apply the logical operation to the data.
+    def run(
+        self,
+        data: Union[np.ndarray, List[float], List["RegionProperties"], pd.Series, pd.DataFrame],
+        *args: Any,
+        device: Optional[torch.device] = None,
+    ) -> Union[np.ndarray, torch.Tensor]:
+        """Return values whose indices pass the combined filter criteria."""
+        filters = [
+            Filter.create_from_config(entry) for entry in (self.config.filters or [])
+        ]
+        if not filters:
+            return np.asarray([])
 
-        Args:
-            data: Data to apply the operation to.
-        """
-        return self.accept(data)
+        if self.config.operation == "not" and len(filters) != 1:
+            raise ValueError("FilterOps operation 'not' requires exactly one filter")
+
+        values = filters[0]._convert_input(
+            data,
+            *args,
+            dtype=filters[0].config.preferred_input_type,
+            device=device,
+        )
+        if values.ndim == 0:
+            n = 1
+        else:
+            n = int(values.shape[0])
+
+        index_sets = [_accept_index_set(f.accept_indices(values)) for f in filters]
+        operation = self.config.operation
+        if operation == "and":
+            selected = set.intersection(*index_sets) if index_sets else set()
+        elif operation == "or":
+            selected = set.union(*index_sets) if index_sets else set()
+        elif operation == "xor":
+            selected: set[int] = set()
+            for index_set in index_sets:
+                selected ^= index_set
+        elif operation == "not":
+            selected = set(range(n)) - index_sets[0]
+        else:
+            raise ValueError(f"Unsupported FilterOps operation: {operation!r}")
+
+        if not selected:
+            empty: Union[np.ndarray, torch.Tensor]
+            if isinstance(values, torch.Tensor):
+                empty = values.new_empty((0,) + values.shape[1:])
+            else:
+                empty = np.empty((0,) + values.shape[1:], dtype=values.dtype)
+            return empty
+        order = sorted(selected)
+        return values[order]
 
 class MatrixFilterConfig(FilterConfig):
     """Shared settings for torch-backed matrix filters.
@@ -718,12 +797,16 @@ class RegionFilterConfig(Configuration):
     """Configuration for :class:`RegionFilter`.
 
     Attributes:
-        filters: Ordered list of :class:`Filter` instances (for example
-            :class:`RangeFilter`, :class:`MinFilter`). All filters must pass
-            (logical AND) for a region to be kept.
+        filters: Ordered list of :class:`FilterConfig` entries. All filters must
+            pass (logical AND) for a region to be kept.
     """
 
     filters: List[FilterConfig] = []
+
+    @field_validator("filters", mode="before")
+    @classmethod
+    def _filters_must_be_configs(cls, filters: Any) -> Any:
+        return _reject_configurable_filter_entries(filters)
 
     @model_validator(mode="after")
     def validate_filters(self) -> "RegionFilterConfig":
@@ -744,7 +827,7 @@ class RegionFilterConfig(Configuration):
             return self
 
         for filter in self.filters:
-            fc = filter.config if isinstance(filter, Filter) else filter
+            fc = _filter_config_entry(filter)
             attributes = fc.attribute_list()
             if attributes is None or len(attributes) == 0:
                 continue
@@ -796,36 +879,43 @@ class RegionFilter(Configurable[RegionFilterConfig]):
         return mask
 
     def has_filter(self, attribute: str) -> bool:
-        """Return whether any filter's ``config.attribute`` equals *attribute*.
+        """Return whether any filter targets *attribute*.
 
-        Only exact string matches are detected; list-valued attributes are not
-        searched element-wise.
+        Matches a string ``attribute`` field exactly, or membership in a
+        list-valued ``attribute``.
         """
-        for filter in self.config.filters:
-            if filter.config.attribute == attribute:
+        for entry in self.config.filters or []:
+            fc = _filter_config_entry(entry)
+            attr = fc.attribute
+            if attr == attribute:
+                return True
+            if isinstance(attr, list) and attribute in attr:
                 return True
         return False
 
     def get_filter(self, attribute: str) -> Filter:
-        """Return the first filter whose ``config.attribute`` equals *attribute*.
+        """Return the first :class:`Filter` whose config targets *attribute*.
 
         Raises:
-            ValueError: If no filter matches exactly.
+            ValueError: If no filter matches.
         """
-        for filter in self.config.filters:
-            if filter.config.attribute == attribute:
-                return filter
+        for entry in self.config.filters or []:
+            fc = _filter_config_entry(entry)
+            attr = fc.attribute
+            if attr == attribute or (isinstance(attr, list) and attribute in attr):
+                return Filter.create_from_config(entry)
         raise ValueError(f"Filter for attribute '{attribute}' not found")
 
     def get_attribute_names(self) -> List[Union[str, List[str]]]:
-        """Return each filter's ``config.attribute`` (string or list, unflattened)."""
-        if self.config.filters is None or len(self.config.filters) == 0:
+        """Return each filter's ``attribute`` (string or list, unflattened)."""
+        if not self.config.filters:
             return []
-        return [
-            filter.config.attribute
-            for filter in self.config.filters
-            if filter.config.attribute is not None
-        ]
+        names: List[Union[str, List[str]]] = []
+        for entry in self.config.filters:
+            fc = _filter_config_entry(entry)
+            if fc.attribute is not None:
+                names.append(fc.attribute)
+        return names
 
     @task(name="RegionFilter.run")
     def run(self, regions: Union[List["RegionProperties"], pd.DataFrame]) -> Tuple[
