@@ -112,7 +112,14 @@ export QT_QPA_PLATFORM=offscreen # for napari headless
 # Isolate Prefect state per Slurm array task (scratch, not shared home).
 export PREFECT_HOME="/scratch/$USER/prefect-${SLURM_JOB_ID:-$$}-${SLURM_ARRAY_TASK_ID:-0}"
 mkdir -p "$PREFECT_HOME"
+
+# Use Prefect Cloud. These should be exported before sbatch is submitted.
+: "${PREFECT_API_URL:?PREFECT_API_URL must be set for Prefect Cloud}"
+: "${PREFECT_API_KEY:?PREFECT_API_KEY must be set for Prefect Cloud}"
+
 echo "Prefect home: $PREFECT_HOME"
+echo "PREFECT_API_URL=$PREFECT_API_URL"
+echo "PREFECT_API_KEY is set"
 
 # Run vistiq pipeline on the selected file
 # Global options (--loglevel, --processes, --device) must come before the subcommand name
