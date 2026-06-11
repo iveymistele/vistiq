@@ -108,16 +108,9 @@ if ! command -v vistiq >/dev/null 2>&1; then
 fi
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
-# Isolate Prefect's local state per Slurm array task.
-# This avoids multiple array tasks sharing the same temporary Prefect DB/server state.
+# Isolate Prefect state per Slurm array task (scratch, not shared home).
 export PREFECT_HOME="/scratch/$USER/prefect-${SLURM_JOB_ID:-$$}-${SLURM_ARRAY_TASK_ID:-0}"
 mkdir -p "$PREFECT_HOME"
-
-# Reduce Prefect API/logging chatter; logs still go to Slurm .err/.log files.
-unset PREFECT_API_URL
-export PREFECT_LOGGING_TO_API_ENABLED=false
-export PREFECT_CLOUD_ENABLE_ORCHESTRATION_TELEMETRY=false
-
 echo "Prefect home: $PREFECT_HOME"
 
 # Run vistiq pipeline on the selected file
