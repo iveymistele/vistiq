@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# image files
+*.lif
+*.tif
+
 # C extensions
 *.so
 
@@ -84,6 +88,11 @@ src/vistiq/_version.py
 
 # microsam embeddings
 embeddings/
+
+# output directories
+out/
+output/
+results/
 
 # prefect logs
 /logs/
