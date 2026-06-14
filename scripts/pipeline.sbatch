@@ -17,7 +17,7 @@ set -euo pipefail
 #   sbatch --array=1-3 scripts/pipeline.sbatch lif_pilot.txt /path/to/jobrun
 #
 # Scrib488/Dpn555/EdU647 fly-brain batch (pilot or full folder):
-#   bash scripts/submit-scrib-pipeline.sh pilot /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
+#   bash scripts/submit-scrib-pipeline.sh pilot /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-edu-dpn.lif
 #   bash scripts/submit-scrib-pipeline.sh batch   # needs SCRIB_RAW_DIR + JOBRUN_ROOT
 
 # Check if file list is provided

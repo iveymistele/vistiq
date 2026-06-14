@@ -6,20 +6,20 @@
 #
 # Three modes:
 #   pilot  - one .lif copied to scratch (test before full batch)
-#   batch  - all Animal-*-scrib-dpn-edu.lif files under a Raw files folder
+#   batch  - all Animal-*-scrib-edu-dpn.lif files under a Raw files folder
 #   rerun  - resubmit only selected array task IDs from a prior batch file list
 #
 # Pilot example (copy to scratch first, recommended):
 #   mkdir -p /sfs/weka/scratch/zyh4up/batch-test/input
-#   cp "/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/Animal-1-scrib-dpn-edu.lif" \
+#   cp "/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/Animal-1-scrib-edu-dpn.lif" \
 #      /sfs/weka/scratch/zyh4up/batch-test/input/
 #   export VISTIQ_SCRATCH=/sfs/weka/scratch/zyh4up/batch-test
 #   export VISTIQ_ENV=/sfs/weka/scratch/zyh4up/vistiq-env-gpu
 #   export SLURM_ACCOUNT=siegristlab
 #   bash scripts/submit-scrib-pipeline.sh pilot \
-#     /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
+#     /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-edu-dpn.lif
 #
-# Full batch (all Animal-*-scrib-dpn-edu.lif in Raw files):
+# Full batch (all Animal-*-scrib-edu-dpn.lif in Raw files):
 #   export SLURM_ACCOUNT=siegristlab
 #   bash scripts/submit-scrib-pipeline.sh batch
 #
@@ -42,18 +42,18 @@ VISTIQ_SCRATCH="${VISTIQ_SCRATCH:-/sfs/weka/scratch/zyh4up/batch-test}"
 VISTIQ_ENV="${VISTIQ_ENV:-/sfs/weka/scratch/zyh4up/vistiq-env-gpu}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_TIME="${SLURM_TIME:-6:00:00}"
-SCRIB_GLOB="${SCRIB_GLOB:-Animal-*-scrib-dpn-edu.lif}"
+SCRIB_GLOB="${SCRIB_GLOB:-Animal-*-scrib-edu-dpn.lif}"
 
 SCRIB_DATASET_ROOT="${SCRIB_DATASET_ROOT:-/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647}"
 SCRIB_RAW_DIR="${SCRIB_RAW_DIR:-$SCRIB_DATASET_ROOT/Raw files}"
 JOBRUN_ROOT="${JOBRUN_ROOT:-/standard/vol191/siegristlab/Microsam_Segmentation/jobruns/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647}"
 
-ANIMAL1_LIF="$SCRIB_RAW_DIR/Animal-1-scrib-dpn-edu.lif"
+ANIMAL1_LIF="$SCRIB_RAW_DIR/Animal-1-scrib-edu-dpn.lif"
 
 usage() {
     cat <<EOF
 Usage:
-  $0 pilot <path/to/Animal-1-scrib-dpn-edu.lif> [output_subdir]
+  $0 pilot <path/to/Animal-1-scrib-edu-dpn.lif> [output_subdir]
   $0 batch
   $0 rerun <array_spec> [filelist]
   $0 rerun-failed <slurm_job_id> [filelist]

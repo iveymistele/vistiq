@@ -10,7 +10,7 @@ if [[ $# -lt 2 ]]; then
     echo "  glob_pattern: Optional find -name pattern (default: *.lif)"
     echo ""
     echo "Example (Scrib/Dpn/EdU batch):"
-    echo "  $0 '/path/Scrib488 Dpn555 EdU 647/Raw files' scrib.filelist 'Animal-*-scrib-dpn-edu.lif'"
+    echo "  $0 '/path/Scrib488 Dpn555 EdU 647/Raw files' scrib.filelist 'Animal-*-scrib-edu-dpn.lif'"
     exit 1
 fi
 
