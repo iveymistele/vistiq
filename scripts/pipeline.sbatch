@@ -104,10 +104,10 @@ if [[ ! -d "$VISTIQ_ENV" ]]; then
 fi
 
 # UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
-# activation unless we reset shell state and re-source the hook.
+# activation unless we reset shell state and re-source the mamba hook.
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
 export CONDA_SHLVL=0
-eval "$(conda shell.bash hook)"
+eval "$(mamba shell hook --shell bash)"
 mamba activate "$VISTIQ_ENV"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
