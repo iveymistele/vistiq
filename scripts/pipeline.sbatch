@@ -17,7 +17,7 @@ set -euo pipefail
 #   sbatch --array=1-3 scripts/pipeline.sbatch lif_pilot.txt /path/to/jobrun
 #
 # Scrib488/Dpn555/EdU647 fly-brain batch (pilot or full folder):
-#   bash scripts/submit-scrib-pipeline.sh pilot /scratch/.../Animal-1-scrib-dpn-edu.lif
+#   bash scripts/submit-scrib-pipeline.sh pilot /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
 #   bash scripts/submit-scrib-pipeline.sh batch   # needs SCRIB_RAW_DIR + JOBRUN_ROOT
 
 # Check if file list is provided
@@ -96,17 +96,26 @@ echo "Output:  $output_dir"
 
 module purge
 module load miniforge
-VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
-export LD_LIBRARY_PATH="$VISTIQ_ENV/lib:${LD_LIBRARY_PATH:-}"
-# UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
-# `conda activate` (including `eval "$(conda shell.bash hook)"`). Use the env directly.
-unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
-export CONDA_SHLVL=0
-export PATH="${VISTIQ_ENV}/bin:${PATH}"
-if ! command -v vistiq >/dev/null 2>&1; then
-    echo "Error: vistiq not found in ${VISTIQ_ENV}/bin (set VISTIQ_ENV to your conda env prefix)"
+
+VISTIQ_ENV="${VISTIQ_ENV:-/sfs/weka/scratch/zyh4up/vistiq-env-gpu}"
+if [[ ! -d "$VISTIQ_ENV" ]]; then
+    echo "Error: VISTIQ_ENV not found: $VISTIQ_ENV"
     exit 1
 fi
+
+# UVA miniforge module can leave CONDA_SHLVL=1 with CONDA_PREFIX unset, which breaks
+# activation unless we reset shell state and re-source the hook.
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER || true
+export CONDA_SHLVL=0
+eval "$(conda shell.bash hook)"
+mamba activate "$VISTIQ_ENV"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+if ! command -v vistiq >/dev/null 2>&1; then
+    echo "Error: vistiq not found after mamba activate ${VISTIQ_ENV}"
+    exit 1
+fi
+echo "Using environment: $CONDA_PREFIX"
 export QT_QPA_PLATFORM=offscreen # for napari headless
 
 # Isolate Prefect state per Slurm array task (scratch, not shared home).

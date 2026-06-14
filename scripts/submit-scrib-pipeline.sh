@@ -10,14 +10,14 @@
 #   rerun  - resubmit only selected array task IDs from a prior batch file list
 #
 # Pilot example (copy to scratch first, recommended):
-#   mkdir -p /scratch/zyh4up/batch-test/input
+#   mkdir -p /sfs/weka/scratch/zyh4up/batch-test/input
 #   cp "/standard/vol191/siegristlab/Microsam_Segmentation/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/Animal-1-scrib-dpn-edu.lif" \
-#      /scratch/zyh4up/batch-test/input/
-#   export VISTIQ_SCRATCH=/scratch/zyh4up/batch-test
-#   export VISTIQ_ENV=/scratch/zyh4up/vistiq-env-gpu
+#      /sfs/weka/scratch/zyh4up/batch-test/input/
+#   export VISTIQ_SCRATCH=/sfs/weka/scratch/zyh4up/batch-test
+#   export VISTIQ_ENV=/sfs/weka/scratch/zyh4up/vistiq-env-gpu
 #   export SLURM_ACCOUNT=siegristlab
 #   bash scripts/submit-scrib-pipeline.sh pilot \
-#     /scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
+#     /sfs/weka/scratch/zyh4up/batch-test/input/Animal-1-scrib-dpn-edu.lif
 #
 # Full batch (all Animal-*-scrib-dpn-edu.lif in Raw files):
 #   export SLURM_ACCOUNT=siegristlab
@@ -38,9 +38,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PIPELINE_SBATCH="$SCRIPT_DIR/pipeline.sbatch"
 FILELIST_SH="$SCRIPT_DIR/filelist.sh"
 
-VISTIQ_SCRATCH="${VISTIQ_SCRATCH:-/scratch/zyh4up/batch-test}"
-VISTIQ_ENV="${VISTIQ_ENV:-/home/zyh4up/.conda/envs/vistiq-env-gpu}"
-export LD_LIBRARY_PATH="$VISTIQ_ENV/lib:${LD_LIBRARY_PATH:-}"
+VISTIQ_SCRATCH="${VISTIQ_SCRATCH:-/sfs/weka/scratch/zyh4up/batch-test}"
+VISTIQ_ENV="${VISTIQ_ENV:-/sfs/weka/scratch/zyh4up/vistiq-env-gpu}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_TIME="${SLURM_TIME:-6:00:00}"
 SCRIB_GLOB="${SCRIB_GLOB:-Animal-*-scrib-dpn-edu.lif}"
@@ -66,7 +65,7 @@ Usage:
 
 Environment variables:
   VISTIQ_SCRATCH   Scratch workspace (default: $VISTIQ_SCRATCH)
-  VISTIQ_ENV       Conda env to activate in sbatch (default: $VISTIQ_ENV)
+  VISTIQ_ENV       Conda/mamba env prefix for jobs (default: $VISTIQ_ENV)
   SLURM_ACCOUNT    Slurm account, e.g. siegristlab (optional)
   SLURM_TIME       Job wall time (default: $SLURM_TIME)
   SCRIB_DATASET_ROOT  Dataset folder (default: AkhGal4 Scrib488 line)
