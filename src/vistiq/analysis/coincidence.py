@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import logging
+import re
+from pathlib import Path
 from typing import Literal, Dict, List, Tuple, Optional, Any
 from pydantic import Field, field_validator
 from skimage.measure import regionprops
@@ -51,14 +53,211 @@ def merge_coincidence_into_features(
         for col in coin_cols:
             if col not in combined.columns:
                 continue
-            if col.endswith(" +"):
+            # Boolean flags are "{channel} +"; score columns are "{method} {channel} +"
+            # (e.g. "dice Green +") and must stay numeric.
+            if col.endswith(" +") and not col.startswith(("dice ", "iou ")):
                 combined[col] = combined[col].fillna(False).astype(bool)
             else:
-                combined[col] = combined[col].fillna(0.0)
+                combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0.0)
 
         merged[stack_name] = combined
 
     return merged
+
+
+def _sanitize_channel_name(name: str) -> str:
+    return re.sub(r"[^\w\-.]+", "_", name.strip()) or "Ch0"
+
+
+def _canonical_channel_name(name: str) -> str:
+    return coincidence_display_name(_sanitize_channel_name(name))
+
+
+def _channel_name_from_stem(stem: str, prefix: str) -> Optional[str]:
+    token = f"{prefix}_"
+    if stem.startswith(token):
+        return _canonical_channel_name(stem[len(token) :])
+    return None
+
+
+def _coincidence_column_names(columns: List[str]) -> List[str]:
+    return [col for col in columns if col.endswith(" +")]
+
+
+def _read_coincidence_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "label" in df.columns:
+        return df.set_index("label")
+    first = df.columns[0]
+    if first in {"label", "Unnamed: 0"} or first == "":
+        return df.set_index(first).rename_axis("label")
+    return df
+
+
+def _merge_coincidence_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    merged = frames[0].copy()
+    for frame in frames[1:]:
+        merged = merged.join(frame, how="outer")
+    return merged
+
+
+def parse_coincidence_stem(
+    stem: str, known_channels: set[str]
+) -> Optional[Tuple[str, str, str]]:
+    """Parse ``Coincidence_{stack}_{ch_a}_vs_{ch_b}`` into channel names."""
+    token = "Coincidence_"
+    if not stem.startswith(token):
+        return None
+    rest = stem[len(token) :]
+    if "_vs_" not in rest:
+        return None
+    left, ch_b = rest.rsplit("_vs_", 1)
+    if ch_b not in known_channels:
+        return None
+    for ch_a in known_channels:
+        suffix = f"_{ch_a}"
+        if left.endswith(suffix):
+            stack = left[: -len(suffix)]
+            if stack in known_channels:
+                return stack, ch_a, ch_b
+    return None
+
+
+def _known_channels_in_dir(work_dir: Path) -> set[str]:
+    known: set[str] = set()
+    for path in work_dir.glob("Features_*.csv"):
+        channel = _channel_name_from_stem(path.stem, "Features")
+        if channel is not None:
+            known.add(channel)
+    for path in work_dir.glob("Labels_*.tif"):
+        channel = _channel_name_from_stem(path.stem, "Labels")
+        if channel is not None:
+            known.add(channel)
+
+    for path in work_dir.glob("Coincidence_*.csv"):
+        rest = path.stem[len("Coincidence_") :]
+        if "_vs_" in rest:
+            _left, ch_b = rest.rsplit("_vs_", 1)
+            known.add(_canonical_channel_name(ch_b))
+
+    changed = True
+    while changed:
+        changed = False
+        for path in work_dir.glob("Coincidence_*.csv"):
+            parsed = parse_coincidence_stem(path.stem, known)
+            if parsed is None:
+                continue
+            for name in parsed:
+                canon = _canonical_channel_name(name)
+                if canon not in known:
+                    known.add(canon)
+                    changed = True
+    return known
+
+
+def load_coincidence_by_stack(work_dir: Path) -> Dict[str, pd.DataFrame]:
+    """Group existing Coincidence_*.csv files by stack/channel name."""
+    known_channels = _known_channels_in_dir(work_dir)
+    by_stack: Dict[str, List[pd.DataFrame]] = {}
+
+    for path in sorted(work_dir.glob("Coincidence_*.csv")):
+        parsed = parse_coincidence_stem(path.stem, known_channels)
+        if parsed is None:
+            logger.warning("Skipping unrecognized coincidence file: %s", path.name)
+            continue
+        stack, _ch_a, _ch_b = parsed
+        by_stack.setdefault(stack, []).append(_read_coincidence_csv(path))
+
+    return {
+        _canonical_channel_name(stack): _merge_coincidence_frames(frames)
+        for stack, frames in by_stack.items()
+        if frames
+    }
+
+
+def remerge_coincidence_into_features(
+    work_dir: Path,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Path]:
+    """Re-merge existing Coincidence_*.csv files into Features_*.csv tables."""
+    work_dir = work_dir.resolve()
+    merged_coincidence = load_coincidence_by_stack(work_dir)
+    if not merged_coincidence:
+        logger.warning("No Coincidence_*.csv files found in %s", work_dir)
+        return {}
+
+    feature_paths: Dict[str, Path] = {}
+    for path in sorted(work_dir.glob("Features_*.csv")):
+        channel = _channel_name_from_stem(path.stem, "Features")
+        if channel is not None:
+            feature_paths[channel] = path
+
+    if not feature_paths:
+        logger.warning("No Features_*.csv found in %s", work_dir)
+        return {}
+
+    feature_dfs: Dict[str, pd.DataFrame] = {}
+    path_by_canonical: Dict[str, Path] = {}
+    for ch, path in feature_paths.items():
+        canonical = _canonical_channel_name(ch)
+        if canonical not in merged_coincidence:
+            logger.info(
+                "Skipping %s: no coincidence tables for channel %s",
+                path.name,
+                canonical,
+            )
+            continue
+        df = pd.read_csv(path)
+        drop_cols = _coincidence_column_names(list(df.columns))
+        if drop_cols:
+            logger.info(
+                "Dropping old coincidence columns from %s: %s", path.name, drop_cols
+            )
+            df = df.drop(columns=drop_cols)
+        feature_dfs[canonical] = df
+        path_by_canonical[canonical] = path
+
+    if not feature_dfs:
+        logger.warning(
+            "No feature CSVs matched coincidence stacks in %s "
+            "(feature channels=%s, coincidence stacks=%s)",
+            work_dir,
+            sorted(feature_paths.keys()),
+            sorted(merged_coincidence.keys()),
+        )
+        return {}
+
+    merged_features = merge_coincidence_into_features(feature_dfs, merged_coincidence)
+    updated: Dict[str, Path] = {}
+    for ch, df in merged_features.items():
+        out_path = path_by_canonical.get(ch)
+        if out_path is None:
+            continue
+        coin_cols = [col for col in df.columns if col.endswith(" +")]
+        logger.info(
+            "Channel %s: %d coincidence columns (%s)",
+            ch,
+            len(coin_cols),
+            ", ".join(coin_cols) if coin_cols else "none",
+        )
+        for col in coin_cols:
+            if col.startswith(("dice ", "iou ")):
+                logger.info(
+                    "  %s dtype=%s sample=%s",
+                    col,
+                    df[col].dtype,
+                    df[col].head(3).tolist(),
+                )
+        if dry_run:
+            logger.info("[dry-run] Would update %s", out_path)
+            continue
+        df.to_csv(out_path, index=False)
+        logger.info("Updated %s", out_path)
+        updated[ch] = out_path
+    return updated
 
 
 class CoincidenceDetectorConfig(StackProcessorConfig):
