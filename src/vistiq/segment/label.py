@@ -222,7 +222,7 @@ def remap_labels(
         (old_label, new_label) tuples.
     """
     labels = np.asarray(labels)
-    unique_labels = np.unique(labels, sorted=True)
+    unique_labels = np.unique(labels)
     do_exclude = exclude is not None and len(exclude) > 0
     logger.debug(f"Unique labels: {unique_labels}, exclude={exclude}")
     if len(unique_labels) == 0:
