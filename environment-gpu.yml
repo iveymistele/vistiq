@@ -1,54 +1,59 @@
 name: vistiq-env-gpu
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
-  - defaults
 
 dependencies:
-  - python=3.12
+  # UVA HPC (Rivanna/Afton): miniforge + mamba, conda-forge only.
+  #
+  # Create on scratch or /standard (not $HOME):
+  #   module load miniforge
+  #   mamba env create --prefix /sfs/weka/scratch/zyh4up/vistiq-env-gpu -f environment-gpu.yml
+  #
+  # UVA note: recent conda-forge builds of bioio/bioio-ome-tiff require py>=3.11,
+  # but PyPI supports py3.10. Install the bioio stack via pip to avoid that mismatch.
+  #
+  # Jobs should NOT `module load cuda`; this env bundles CUDA runtimes.
+
+  - python=3.10
   - pip
   - setuptools
   - wheel
 
-  # Core scientific/python stack
-  - numpy>=1.21
-  - pandas>=1.3.1
-  - scipy>=1.10
-  - scikit-image>=0.18.2
-  - matplotlib
-  - joblib
-  - tifffile
-
-  # dask
-  - dask-core>=2022.3.0
-  - dask-image>=0.10.0
+  # Core stack (imported directly by vistiq)
+  - numpy>=1.26.4,<2.2
+  - pandas>=2.2,<3
+  - scipy>=1.11,<2
+  - scikit-image>=0.22,<0.25
+  - scikit-learn>=1.4,<2
+  - matplotlib>=3.8,<4
+  - joblib>=1.3,<2
+  - tifffile>=2023.8,<2025.1.10
 
   # Config / workflow / CLI
-  - pydantic>=2.10
-  - prefect>=3.0.0
-  - typer
+  - pydantic>=2.10,<3
+  - prefect>=3.0,<4
+  - typer>=0.12,<1
 
-  # GPU torch stack
-  - pytorch::pytorch
-  - pytorch::torchvision
-  - pytorch::torchaudio
-  - pytorch-cuda=12.1
+  # GPU torch stack from conda-forge (recommended by micro_sam)
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - libtorch=*=*cuda12*
 
-  # Imaging / IO
-  - bioio>=3.0.0
-  - bioio-ome-tiff>=1.4.0
+  # micro_sam + training stack
   - micro_sam=1.6.2
-
-  # Prefer conda if it resolves cleanly
-  - torch_em
+  - torch_em=0.8.3
+  - python-elf=0.8.1
 
   - pip:
       - -e .
-      - bioio-lif>=1.4.1
-      - bioio-tifffile>=1.3.0
-      - bioio-nd2>=1.5.0
-      - napari>=0.6.6
-      - napari-animation>=0.0.9
-      - opencv-python-headless>=4.12.0
-      - stackview>=0.18.0
+      # bioio stack via pip (avoid UVA conda py>=3.11 pins on bioio 3.3.x)
+      - bioio==3.3.0
+      - bioio-ome-tiff==1.4.0
+      - bioio-lif>=1.4.1,<2
+      - bioio-tifffile>=1.3.0,<2
+      - bioio-nd2>=1.5.0,<2
+      - opencv-python-headless>=4.10,<5
+
+      # Optional: notebooks / interactive visualization only
+      - napari-animation>=0.0.9,<0.1
+      - stackview>=0.18,<0.19
